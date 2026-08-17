@@ -1,0 +1,28 @@
+# 服务器配置文件只保存连接服务器所需的基础信息。
+# 任务通过 PARAMETER_FILE 引用本文件，部署流程、项目和命令不要写在这里。
+
+# 目标服务器 IP 地址或域名。
+IP_ADDRESS=
+
+# SSH 连接端口，通常为 22。
+PORT=22
+
+# SSH 登录用户名。
+USERNAME=
+
+# SSH 登录密码；开启“隐藏密码”后会加密保存，未开启时保持普通明文。
+# 请妥善保管配置文件，不要提交到代码仓库或发送给无关人员。
+PASSWORD=
+
+# SSH 私钥的本地绝对路径；使用密码或 SSH Agent 时可以留空。
+KEY_FILENAME=
+
+# 仅用于在配置页面点击“连接”后进入指定的服务器目录。
+# 全部留空时保持服务器登录目录；一个目录时自动进入；多个目录时连接前弹窗选择。
+# 执行任务时不会读取这些默认路径。远程命令或脚本需要在任务步骤的 PATH 中指定目录；
+# 任务步骤的 PATH 留空时使用服务器登录目录。
+# 更多目录可继续增加 DEFAULT_OPEN_PATH_3、DEFAULT_OPEN_PATH_4 等参数。
+# 示例：DEFAULT_OPEN_PATH_1=/usr/local/app
+# 示例：DEFAULT_OPEN_PATH_2=/var/log/app
+DEFAULT_OPEN_PATH_1=
+DEFAULT_OPEN_PATH_2=
