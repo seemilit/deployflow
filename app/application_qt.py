@@ -18,8 +18,8 @@ import threading
 import traceback
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QSignalBlocker, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QCloseEvent, QFont, QIcon, QKeySequence, QTextCursor
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QSignalBlocker, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QBrush, QCloseEvent, QColor, QFont, QIcon, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -30,6 +30,8 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QGraphicsScene,
+    QGraphicsView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -37,10 +39,12 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -194,6 +198,205 @@ class _WorkerSignals(QObject):
     finished = Signal(str, object)
 
 
+class _WorkflowGraphicsView(QGraphicsView):
+    """Scrollable workflow canvas with cursor-centered wheel zoom."""
+
+    _MIN_ZOOM = 0.35
+    _MAX_ZOOM = 4.0
+    step_clicked = Signal(int)
+    step_double_clicked = Signal(int)
+    step_context_requested = Signal(int, object)
+    save_requested = Signal()
+    zoom_changed = Signal(float)
+
+    def __init__(self, scene: QGraphicsScene, parent: QWidget | None = None) -> None:
+        super().__init__(scene, parent)
+        self._zoom_factor = 1.0
+        self._pressed_step: int | None = None
+        self._press_position: QPoint | None = None
+        self.setTransformationAnchor(QGraphicsView.NoAnchor)
+        self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setInteractive(False)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.OpenHandCursor)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._request_context_menu)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            self._pressed_step = self._step_at(event.position().toPoint())
+            self._press_position = event.position().toPoint()
+            self.setCursor(Qt.ClosedHandCursor)
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.LeftButton:
+            self.setCursor(Qt.OpenHandCursor)
+            position = event.position().toPoint()
+            if (
+                self._pressed_step is not None
+                and self._press_position is not None
+                and (position - self._press_position).manhattanLength() < 5
+                and self._step_at(position) == self._pressed_step
+            ):
+                self.step_clicked.emit(self._pressed_step)
+            self._pressed_step = None
+            self._press_position = None
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.LeftButton:
+            step_index = self._step_at(event.position().toPoint())
+            if step_index is not None:
+                self.step_double_clicked.emit(step_index)
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+    def _request_context_menu(self, position: QPoint) -> None:
+        step_index = self._step_at(position)
+        if step_index is not None:
+            self.step_context_requested.emit(step_index, self.mapToGlobal(position))
+
+    def _step_at(self, position: QPoint) -> int | None:
+        item = self.itemAt(position)
+        if item is None:
+            return None
+        step_index = item.data(Qt.UserRole)
+        return step_index if isinstance(step_index, int) else None
+
+    def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y()
+        if not delta:
+            event.ignore()
+            return
+        cursor_position = event.position().toPoint()
+        before = self.mapToScene(cursor_position)
+        self.zoom(1.15 if delta > 0 else 1 / 1.15)
+        after = self.mapToScene(cursor_position)
+        self.translate(after.x() - before.x(), after.y() - before.y())
+        event.accept()
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.matches(QKeySequence.Save):
+            self.save_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def zoom(self, factor: float) -> None:
+        target = max(self._MIN_ZOOM, min(self._MAX_ZOOM, self._zoom_factor * factor))
+        applied = target / self._zoom_factor
+        if applied != 1:
+            self.scale(applied, applied)
+            self._zoom_factor = target
+            self.zoom_changed.emit(target)
+
+    def fit_scene(self) -> None:
+        self.resetTransform()
+        scene_width = self.sceneRect().width()
+        if scene_width > 0:
+            width_scale = max(0.01, (self.viewport().width() - 12) / scene_width)
+            self.scale(width_scale, width_scale)
+        self.horizontalScrollBar().setValue(0)
+        self.verticalScrollBar().setValue(0)
+        self._zoom_factor = 1.0
+
+
+class _WorkflowDiagramPanel(QWidget):
+    """Embedded visual preview of the ordered workflow steps being edited."""
+
+    _NODE_COLORS = {
+        "SERVER_PARAMETER": "#2563eb",
+        "BUILD": "#7c3aed",
+        "UPLOAD": "#059669",
+        "HEALTH_CHECK": "#dc2626",
+        "REMOTE_COMMAND": "#d97706",
+        "REMOTE_SCRIPT": "#d97706",
+    }
+    step_clicked = Signal(int)
+    step_double_clicked = Signal(int)
+    step_context_requested = Signal(int, object)
+    save_requested = Signal()
+    zoom_changed = Signal(float)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        self.scene = QGraphicsScene(self)
+        self.view = _WorkflowGraphicsView(self.scene)
+        self.view.step_clicked.connect(self.step_clicked)
+        self.view.step_double_clicked.connect(self.step_double_clicked)
+        self.view.step_context_requested.connect(self.step_context_requested)
+        self.view.save_requested.connect(self.save_requested)
+        self.view.zoom_changed.connect(self._zoom_changed)
+        self.view.setRenderHint(QPainter.Antialiasing)
+        self.view.setBackgroundBrush(QBrush(QColor("#f8fafc")))
+        layout.addWidget(self.view, 1)
+        self.set_steps([])
+
+    def set_zoom(self, zoom: float) -> None:
+        self._saved_zoom = min(4.0, max(0.35, zoom))
+        self._fit_scene()
+
+    def _zoom_changed(self, zoom: float) -> None:
+        self._saved_zoom = zoom
+        self.zoom_changed.emit(zoom)
+
+    def set_steps(self, steps: list[tuple[int, str]]) -> None:
+        self.scene.clear()
+        self._draw(steps)
+        QTimer.singleShot(0, self._fit_scene)
+
+    def _draw(self, steps: list[tuple[int, str]]) -> None:
+        node_width, node_height = 360, 64
+        center_x, top, spacing = 380, 50, 48
+        nodes: list[tuple[str, str, int | None]] = [("开始", "#0f766e", None)]
+        for index, step_type in steps:
+            definition = WORKFLOW_TYPE_BY_KEY.get(step_type)
+            label = definition.label if definition is not None else step_type
+            nodes.append((f"第 {index} 步：{label}", self._NODE_COLORS.get(step_type, "#475569"), index))
+        nodes.append(("结束", "#334155", None))
+
+        pen = QPen(QColor("#64748b"), 2)
+        for index in range(len(nodes) - 1):
+            start_y = top + index * (node_height + spacing) + node_height
+            end_y = start_y + spacing
+            self.scene.addLine(center_x, start_y, center_x, end_y - 9, pen)
+            arrow = QPolygonF([
+                QPointF(center_x, end_y),
+                QPointF(center_x - 7, end_y - 10),
+                QPointF(center_x + 7, end_y - 10),
+            ])
+            self.scene.addPolygon(arrow, QPen(QColor("#64748b")), QBrush(QColor("#64748b")))
+
+        for index, (label, color, step_index) in enumerate(nodes):
+            y = top + index * (node_height + spacing)
+            path = QPainterPath()
+            path.addRoundedRect(center_x - node_width / 2, y, node_width, node_height, 10, 10)
+            rect = self.scene.addPath(path, QPen(QColor(color), 2), QBrush(QColor("#ffffff")))
+            text = self.scene.addText(label, QFont("Microsoft YaHei", 10))
+            text.setDefaultTextColor(QColor(color))
+            text.setPos(center_x - text.boundingRect().width() / 2, y + 19)
+            rect.setToolTip(label)
+            if step_index is not None:
+                rect.setData(Qt.UserRole, step_index)
+                text.setData(Qt.UserRole, step_index)
+
+        bottom = top + len(nodes) * (node_height + spacing)
+        self.scene.setSceneRect(0, 0, 760, bottom + 40)
+
+    def _fit_scene(self) -> None:
+        self.view.fit_scene()
+        if getattr(self, "_saved_zoom", 1.0) != 1.0:
+            self.view.zoom(self._saved_zoom)
+
+
 class _PasswordDialog(QDialog):
     def __init__(self, parent: QWidget, title: str, prompt: str) -> None:
         super().__init__(parent)
@@ -253,6 +456,7 @@ class ApplicationWindow(QMainWindow):
         self.auto_save_delay_seconds = self._bounded_float(
             "auto_save_delay_seconds", 1.0, 0.5, 30.0
         )
+        self.workflow_zoom = self._bounded_float("workflow_zoom", 1.0, 0.35, 4.0)
         startup_page = str(self.application_settings.get("startup_page", "last"))
         saved_view = str(self.application_settings.get("view_mode", "task"))
         self.view_mode = startup_page if startup_page in {"task", "parameter", "script"} else saved_view
@@ -264,6 +468,7 @@ class ApplicationWindow(QMainWindow):
             if isinstance(saved_files, dict) else {}
         )
         self.current_path: Path | None = None
+        self._structured_workflow_steps: list[dict[str, object]] | None = None
         self._dirty = False
         self._loading_editor = False
         self._changing_selection = False
@@ -384,13 +589,42 @@ class ApplicationWindow(QMainWindow):
         editor_layout = QVBoxLayout(editor_container)
         editor_layout.setContentsMargins(0, 0, 0, 0)
         editor_header = QHBoxLayout()
-        self.editor_title = QLabel("任务编辑")
-        self.editor_title.setStyleSheet("font-weight:600")
-        editor_header.addWidget(self.editor_title)
-        editor_header.addStretch(1)
         self.add_step_button = QPushButton("增加步骤")
+        self.add_step_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.add_step_button.setFixedSize(88, 30)
         self.add_step_button.clicked.connect(self._add_step)
         editor_header.addWidget(self.add_step_button)
+        self.view_toggle = QFrame()
+        self.view_toggle.setObjectName("workflowViewToggle")
+        self.view_toggle.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.view_toggle.setFixedHeight(30)
+        toggle_layout = QHBoxLayout(self.view_toggle)
+        toggle_layout.setContentsMargins(0, 0, 0, 0)
+        toggle_layout.setSpacing(0)
+        toggle_layout.setAlignment(Qt.AlignLeft)
+        self.flow_view_button = QPushButton("视图窗")
+        self.flow_view_button.setObjectName("flowViewToggleButton")
+        self.flow_view_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.flow_view_button.setFixedSize(68, 28)
+        self.flow_view_button.setCheckable(True)
+        self.flow_view_button.toggled.connect(self._sync_editor_display)
+        toggle_layout.addWidget(self.flow_view_button)
+        self.parameter_view_button = QPushButton("参数窗")
+        self.parameter_view_button.setObjectName("parameterViewToggleButton")
+        self.parameter_view_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.parameter_view_button.setFixedSize(68, 28)
+        self.parameter_view_button.setCheckable(True)
+        self.parameter_view_button.toggled.connect(self._sync_editor_display)
+        toggle_layout.addWidget(self.parameter_view_button)
+        self.view_toggle.setStyleSheet(
+            "QFrame#workflowViewToggle { border:1px solid #94a3b8; border-radius:4px; }"
+            "QPushButton { border:0; background:#ffffff; }"
+            "QPushButton#flowViewToggleButton { border-right:1px solid #94a3b8; border-top-left-radius:3px; border-bottom-left-radius:3px; }"
+            "QPushButton#parameterViewToggleButton { border-top-right-radius:3px; border-bottom-right-radius:3px; }"
+            "QPushButton:checked { background:#dbeafe; color:#1d4ed8; font-weight:600; }"
+        )
+        editor_header.addWidget(self.view_toggle)
+        editor_header.addStretch(1)
         editor_layout.addLayout(editor_header)
         self.editor = QPlainTextEdit()
         self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -404,7 +638,21 @@ class ApplicationWindow(QMainWindow):
         self.editor.setContextMenuPolicy(Qt.CustomContextMenu)
         self.editor.customContextMenuRequested.connect(self._show_editor_context_menu)
         self.editor.textChanged.connect(self._editor_changed)
-        editor_layout.addWidget(self.editor, 1)
+        self.editor_splitter = QSplitter(Qt.Horizontal)
+        self.workflow_panel = _WorkflowDiagramPanel()
+        self.workflow_panel.step_clicked.connect(self._focus_workflow_step)
+        self.workflow_panel.step_double_clicked.connect(self._edit_workflow_step)
+        self.workflow_panel.step_context_requested.connect(self._show_workflow_step_context_menu)
+        self.workflow_panel.save_requested.connect(self.save_text)
+        self.workflow_panel.zoom_changed.connect(self._save_workflow_zoom)
+        self.workflow_panel.set_zoom(self.workflow_zoom)
+        self.editor_splitter.addWidget(self.workflow_panel)
+        self.editor_splitter.addWidget(self.editor)
+        self.editor_splitter.setSizes([700, 300])
+        editor_layout.addWidget(self.editor_splitter, 1)
+        self.parameter_view_button.setChecked(True)
+        self.flow_view_button.setChecked(True)
+        self._sync_editor_display()
         self.right_splitter.addWidget(editor_container)
 
         self.interaction_tabs = QTabWidget()
@@ -543,11 +791,91 @@ class ApplicationWindow(QMainWindow):
             return
         self._load_file(path)
 
+    def _load_structured_workflow(self, content: str) -> bool:
+        if self.view_mode != "task":
+            return False
+        try:
+            document = json.loads(content)
+        except json.JSONDecodeError:
+            return False
+        steps = document.get("steps") if isinstance(document, dict) else None
+        if not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps):
+            return False
+        self._structured_workflow_steps = [dict(step) for step in steps]
+        return True
+
+    def _load_legacy_workflow_as_structured(self, path: Path) -> bool:
+        if self.view_mode != "task" or not is_workflow_task(path):
+            return False
+        task = load_workflow_task(path)
+        self._structured_workflow_steps = [
+            {
+                "type": step.type,
+                "properties": {
+                    key: value
+                    for key, value in step.values.items()
+                    if key != "TYPE"
+                },
+            }
+            for step in task.steps
+        ]
+        return True
+
+    def _load_legacy_workflow_text_as_structured(self, content: str) -> bool:
+        values: dict[int, dict[str, str]] = {}
+        for match in re.finditer(
+            r"(?mi)^\s*STEP_(\d+)_([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$",
+            content,
+        ):
+            values.setdefault(int(match.group(1)), {})[match.group(2)] = match.group(3).strip()
+        if not values or any("TYPE" not in step_values for step_values in values.values()):
+            return False
+        self._structured_workflow_steps = [
+            {
+                "type": step_values["TYPE"].upper(),
+                "properties": {
+                    key: value for key, value in step_values.items() if key != "TYPE"
+                },
+            }
+            for _index, step_values in sorted(values.items())
+        ]
+        return True
+
+    def _structured_workflow_storage(self) -> str:
+        return json.dumps(
+            {"version": 2, "steps": self._structured_workflow_steps or []},
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n"
+
+    def _structured_workflow_summary(self) -> str:
+        lines: list[str] = []
+        for index, step in enumerate(self._structured_workflow_steps or [], start=1):
+            step_type = str(step.get("type", "")).upper()
+            definition = WORKFLOW_TYPE_BY_KEY.get(step_type)
+            lines.append(f"第 {index} 步：{definition.label if definition else step_type}")
+            properties = step.get("properties", {})
+            if not isinstance(properties, dict):
+                continue
+            for field in definition.fields if definition is not None else ():
+                value = str(properties.get(field.key, "")).strip()
+                if value:
+                    lines.append(f"  {field.label}：{value}")
+            lines.append("")
+        return "\n".join(lines).rstrip() + ("\n" if lines else "")
+
     def _load_file(self, path: Path) -> bool:
         try:
             stored = path.read_text(encoding="utf-8-sig")
-            displayed, normalized = self._prepare_parameter_content_for_display(stored)
-        except (OSError, UnicodeDecodeError, PasswordProtectionError) as exc:
+            self._structured_workflow_steps = None
+            structured = self._load_structured_workflow(stored)
+            if not structured:
+                structured = self._load_legacy_workflow_as_structured(path)
+            displayed, normalized = (
+                (self._structured_workflow_summary(), stored)
+                if structured else self._prepare_parameter_content_for_display(stored)
+            )
+        except (ConfigurationError, OSError, UnicodeDecodeError, PasswordProtectionError) as exc:
             QMessageBox.critical(self, "读取失败", str(exc))
             return False
         draft = self._draft_path(path)
@@ -555,14 +883,22 @@ class ApplicationWindow(QMainWindow):
         if draft.is_file():
             try:
                 draft_stored = draft.read_text(encoding="utf-8-sig")
-                displayed, normalized = self._prepare_parameter_content_for_display(draft_stored)
+                self._structured_workflow_steps = None
+                structured = self._load_structured_workflow(draft_stored)
+                if not structured:
+                    structured = self._load_legacy_workflow_text_as_structured(draft_stored)
+                displayed, normalized = (
+                    (self._structured_workflow_summary(), draft_stored)
+                    if structured else self._prepare_parameter_content_for_display(draft_stored)
+                )
                 dirty = True
-            except (OSError, UnicodeDecodeError, PasswordProtectionError) as exc:
+            except (ConfigurationError, OSError, UnicodeDecodeError, PasswordProtectionError) as exc:
                 QMessageBox.critical(self, "读取暂存失败", str(exc))
                 return False
         self.current_path = path.resolve()
         self.last_selected_files[self.view_mode] = path.name
         self._set_editor_content(displayed)
+        self.editor.setReadOnly(self._structured_workflow_steps is not None)
         self._dirty = dirty
         self.editor.document().setModified(dirty)
         self.status_label.setText(f"已加载 {path.name}" + ("（存在暂存内容）" if dirty else ""))
@@ -581,11 +917,13 @@ class ApplicationWindow(QMainWindow):
             self.editor.setTextCursor(cursor)
             self.editor.verticalScrollBar().setValue(scroll)
         self._loading_editor = False
+        self._refresh_workflow_diagram()
 
     def _editor_changed(self) -> None:
         if self._loading_editor:
             return
         self._dirty = True
+        self._refresh_workflow_diagram()
         self.status_label.setText("内容已修改，等待自动暂存")
         self.auto_save_timer.start(int(self.auto_save_delay_seconds * 1000))
 
@@ -681,7 +1019,11 @@ class ApplicationWindow(QMainWindow):
         temporary = path.with_name(f".{path.name}.tmp")
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            content = self._content_for_storage(self.editor.toPlainText())
+            content = (
+                self._structured_workflow_storage()
+                if self._structured_workflow_steps is not None
+                else self._content_for_storage(self.editor.toPlainText())
+            )
             temporary.write_text(content, encoding="utf-8")
             temporary.replace(path)
         except (OSError, PasswordProtectionError) as exc:
@@ -868,7 +1210,12 @@ class ApplicationWindow(QMainWindow):
                 return False
         was_dirty = self._dirty
         try:
-            path.write_text(self._content_for_storage(self.editor.toPlainText()), encoding="utf-8")
+            content = (
+                self._structured_workflow_storage()
+                if self._structured_workflow_steps is not None
+                else self._content_for_storage(self.editor.toPlainText())
+            )
+            path.write_text(content, encoding="utf-8")
         except (OSError, PasswordProtectionError) as exc:
             QMessageBox.critical(self, "保存失败", str(exc))
             return False
@@ -883,10 +1230,10 @@ class ApplicationWindow(QMainWindow):
         self._dirty = False
         self.editor.document().setModified(False)
         self.auto_save_timer.stop()
-        self.status_label.setText(f"已保存 {path.name}")
+        self.status_label.setText(f"已保存 {path.stem}")
         self._update_controls()
         if show_message:
-            QMessageBox.information(self, "保存成功", f"已保存文件：{path.name}")
+            QMessageBox.information(self, "保存成功", f"已保存：{path.stem}")
         return True
 
     def _choose_script_extension(self, title: str) -> str | None:
@@ -1002,13 +1349,102 @@ class ApplicationWindow(QMainWindow):
         else:
             self._add_workflow_step()
 
-    def _add_workflow_step(self) -> None:
+    def _workflow_steps_from_editor(self) -> list[tuple[int, str]]:
+        if self._structured_workflow_steps is not None:
+            return [
+                (index, str(step.get("type", "")).upper())
+                for index, step in enumerate(self._structured_workflow_steps, start=1)
+            ]
+        return sorted([
+            (int(match.group(1)), match.group(2).upper())
+            for match in re.finditer(
+                r"(?mi)^\s*STEP_(\d+)_TYPE\s*=\s*([A-Z][A-Z0-9_]*)\s*$",
+                self.editor.toPlainText(),
+            )
+        ])
+
+    def _refresh_workflow_diagram(self) -> None:
+        if hasattr(self, "workflow_panel"):
+            self.workflow_panel.set_steps(self._workflow_steps_from_editor())
+
+    def _focus_workflow_step(self, step_index: int) -> None:
+        if self.view_mode != "task":
+            return
+        block = self.editor.document().firstBlock()
+        pattern = re.compile(rf"\s*STEP_{step_index}_TYPE\s*=", re.IGNORECASE)
+        while block.isValid():
+            if pattern.match(block.text()):
+                cursor = QTextCursor(block)
+                cursor.movePosition(QTextCursor.EndOfBlock, QTextCursor.KeepAnchor)
+                self.editor.setTextCursor(cursor)
+                self.editor.ensureCursorVisible()
+                self.editor.setFocus()
+                return
+            block = block.next()
+
+    def _workflow_step_values(self, step_index: int) -> dict[str, str]:
+        if self._structured_workflow_steps is not None:
+            if not 1 <= step_index <= len(self._structured_workflow_steps):
+                return {}
+            step = self._structured_workflow_steps[step_index - 1]
+            properties = step.get("properties", {})
+            values = {
+                str(key).upper(): str(value)
+                for key, value in properties.items()
+            } if isinstance(properties, dict) else {}
+            values["TYPE"] = str(step.get("type", "")).upper()
+            return values
+        values: dict[str, str] = {}
+        pattern = re.compile(rf"(?mi)^\s*STEP_{step_index}_([A-Z][A-Z0-9_]*)\s*=\s*(.*?)\s*$")
+        for match in pattern.finditer(self.editor.toPlainText()):
+            values[match.group(1).upper()] = match.group(2).strip()
+        return values
+
+    def _edit_workflow_step(self, step_index: int) -> None:
+        if self.view_mode == "task":
+            self._add_workflow_step(step_index)
+
+    def _show_workflow_step_context_menu(self, step_index: int, position: object) -> None:
+        if self.view_mode != "task" or self._deploying:
+            return
+        menu = QMenu(self)
+        action = menu.addAction(f"从第 {step_index} 步开始执行")
+        action.triggered.connect(
+            lambda _checked=False, value=step_index: self.develop_method(value)
+        )
+        menu.exec(position)
+
+    def _sync_editor_display(self, _checked: bool = False) -> None:
+        task_view = self.view_mode == "task"
+        show_editor = not task_view or self.parameter_view_button.isChecked()
+        show_flow = task_view and self.flow_view_button.isChecked()
+        self.editor.setVisible(show_editor)
+        self.workflow_panel.setVisible(show_flow)
+        if show_editor and show_flow:
+            self.editor_splitter.setSizes([700, 300])
+
+    def _save_workflow_zoom(self, zoom: float) -> None:
+        self.workflow_zoom = zoom
+        settings = dict(self.application_settings)
+        settings["workflow_zoom"] = zoom
+        self._write_settings(settings)
+
+    def _add_workflow_step(self, step_index: int | None = None) -> None:
+        if step_index is None and self._structured_workflow_steps is None and not self.editor.toPlainText().strip():
+            self._structured_workflow_steps = []
+        existing_values = self._workflow_step_values(step_index) if step_index is not None else {}
         dialog = QDialog(self)
-        dialog.setWindowTitle("增加流程步骤")
+        dialog.setWindowTitle("编辑流程步骤" if step_index is not None else "增加流程步骤")
+        dialog.setFixedWidth(720)
         root = QVBoxLayout(dialog)
         type_combo = QComboBox()
         for definition in WORKFLOW_TYPES:
             type_combo.addItem(definition.label, definition.key)
+        existing_type = existing_values.get("TYPE")
+        if existing_type:
+            type_index = type_combo.findData(existing_type)
+            if type_index >= 0:
+                type_combo.setCurrentIndex(type_index)
         form = QFormLayout()
         root.addWidget(QLabel("步骤类型："))
         root.addWidget(type_combo)
@@ -1048,10 +1484,9 @@ class ApplicationWindow(QMainWindow):
                     control = QComboBox()
                     control.setEditable(field.selector not in {"yes_no", "boolean", "source"})
                     control.addItems(values)
-                    if field.default:
-                        control.setCurrentText(field.default)
+                    control.setCurrentText(existing_values.get(field.key, field.default))
                 else:
-                    control = QLineEdit(field.default)
+                    control = QLineEdit(existing_values.get(field.key, field.default))
                 controls[field.key] = control
                 form.addRow(field.label + (" *" if field.required else ""), control)
             if definition.key == "UPLOAD":
@@ -1076,7 +1511,7 @@ class ApplicationWindow(QMainWindow):
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         root.addWidget(buttons)
-        dialog.resize(680, min(720, dialog.sizeHint().height()))
+        dialog.resize(720, min(720, dialog.sizeHint().height()))
         if dialog.exec() != QDialog.Accepted:
             return
         definition = WORKFLOW_TYPE_BY_KEY[str(type_combo.currentData())]
@@ -1092,12 +1527,49 @@ class ApplicationWindow(QMainWindow):
             QMessageBox.critical(self, "参数不足", "请填写：" + "、".join(missing))
             return
         indexes = [int(value) for value in re.findall(r"(?mi)^\s*STEP_(\d+)_TYPE\s*=", self.editor.toPlainText())]
-        index = max(indexes, default=0) + 1
+        index = (
+            step_index if step_index is not None
+            else len(self._structured_workflow_steps) + 1
+            if self._structured_workflow_steps is not None
+            else max(indexes, default=0) + 1
+        )
         block = [f"STEP_{index}_TYPE={definition.key}"]
         block.extend(f"STEP_{index}_{field.key}={values[field.key]}" for field in definition.fields if values[field.key] or field.required)
-        updated = self.editor.toPlainText().rstrip()
-        self._set_editor_content((updated + "\n\n" if updated else "") + "\n".join(block) + "\n", preserve_view=True)
-        self._mark_changed(f"已暂存第 {index} 个流程步骤：{definition.label}")
+        if self._structured_workflow_steps is not None:
+            step_object = {
+                "type": definition.key,
+                "properties": {
+                    field.key: values[field.key]
+                    for field in definition.fields
+                    if values[field.key] or field.required
+                },
+            }
+            if step_index is None:
+                self._structured_workflow_steps.append(step_object)
+            else:
+                self._structured_workflow_steps[step_index - 1] = step_object
+            self._set_editor_content(self._structured_workflow_summary(), preserve_view=True)
+            self.editor.setReadOnly(True)
+            status = f"已暂存第 {index} 步：{definition.label}"
+        elif step_index is None:
+            updated = self.editor.toPlainText().rstrip()
+            content = (updated + "\n\n" if updated else "") + "\n".join(block) + "\n"
+            status = f"已暂存第 {index} 个流程步骤：{definition.label}"
+        else:
+            lines = self.editor.toPlainText().splitlines()
+            step_pattern = re.compile(rf"^\s*STEP_{index}_[A-Z][A-Z0-9_]*\s*=", re.IGNORECASE)
+            positions = [line_index for line_index, line in enumerate(lines) if step_pattern.match(line)]
+            if not positions:
+                QMessageBox.warning(self, "步骤不存在", f"当前任务中找不到第 {index} 步")
+                return
+            insert_at = positions[0]
+            retained = [line for line in lines if not step_pattern.match(line)]
+            removed_before = sum(1 for line in lines[:insert_at] if step_pattern.match(line))
+            retained[insert_at - removed_before:insert_at - removed_before] = block
+            content = "\n".join(retained).rstrip() + "\n"
+            status = f"已暂存第 {index} 步：{definition.label}"
+        self._set_editor_content(content, preserve_view=True)
+        self._mark_changed(status)
 
     def _add_legacy_restart_step(self) -> None:
         scripts = [p.name for p in sorted(self.script_dir.iterdir()) if p.is_file()]
@@ -1418,7 +1890,10 @@ class ApplicationWindow(QMainWindow):
         self.password_button.setEnabled(not self._deploying and (not self._password_hiding_enabled() or self.current_path is not None))
         self.connect_button.setEnabled(not self._deploying and self.view_mode == "parameter" and self.current_path is not None)
         self.add_step_button.setVisible(self.view_mode == "task")
-        self.editor_title.setText(f"{self._view_label()}编辑")
+        for button in (self.parameter_view_button, self.flow_view_button):
+            button.setVisible(self.view_mode == "task")
+            button.setEnabled(not self._deploying)
+        self._sync_editor_display()
         self.execute_button.setText("停止" if self._deploying else "执行")
         self.execute_button.setEnabled((not self._deploying and self.view_mode == "task") or (self._deploying and not self._stop_requested))
         self.interaction_button.setText("隐藏交互窗口" if self.interaction_tabs.isVisible() else "显示交互窗口")
@@ -1855,6 +2330,7 @@ class ApplicationWindow(QMainWindow):
         settings = dict(self.application_settings)
         settings.update({
             "editor_font_size": self.editor_font_size,
+            "workflow_zoom": self.workflow_zoom,
             "view_mode": self.view_mode,
             "selected_files": dict(self.last_selected_files),
             "window_state": "zoomed" if self.isMaximized() else "normal",

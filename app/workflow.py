@@ -6,6 +6,7 @@ parameters it needs, so server A and server B can be used in one task.
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -144,14 +145,27 @@ class WorkflowTask:
 
 def is_workflow_task(path: str | Path) -> bool:
     content = Path(path).read_text(encoding="utf-8-sig")
-    return bool(re.search(r"(?m)^\s*STEP_\d+_TYPE\s*=", content))
+    if bool(re.search(r"(?m)^\s*STEP_\d+_TYPE\s*=", content)):
+        return True
+    try:
+        document = json.loads(content)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(document, dict) and isinstance(document.get("steps"), list)
 
 
 def load_workflow_task(path: str | Path) -> WorkflowTask:
     file_path = Path(path).resolve()
+    content = file_path.read_text(encoding="utf-8-sig")
+    try:
+        document = json.loads(content)
+    except json.JSONDecodeError:
+        document = None
+    if isinstance(document, dict) and isinstance(document.get("steps"), list):
+        return _load_object_workflow(file_path, document["steps"])
     values: dict[int, dict[str, str]] = {}
     for line_number, raw_line in enumerate(
-        file_path.read_text(encoding="utf-8-sig").splitlines(), start=1
+        content.splitlines(), start=1
     ):
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -185,6 +199,27 @@ def load_workflow_task(path: str | Path) -> WorkflowTask:
             raise ConfigurationError(f"第 {index} 步的 TYPE 不支持：{step_type or '未填写'}")
         _validate_step(index, step_type, step_values)
         steps.append(WorkflowStep(index, step_type, step_values))
+    _validate_unique_names(steps)
+    return WorkflowTask(file_path.stem, file_path, tuple(steps))
+
+
+def _load_object_workflow(file_path: Path, raw_steps: list[object]) -> WorkflowTask:
+    if not raw_steps:
+        raise ConfigurationError("任务中没有流程步骤，请点击“增加步骤”创建")
+    steps: list[WorkflowStep] = []
+    for index, raw_step in enumerate(raw_steps, start=1):
+        if not isinstance(raw_step, dict):
+            raise ConfigurationError(f"第 {index} 步必须是步骤对象")
+        step_type = str(raw_step.get("type", "")).strip().upper()
+        raw_values = raw_step.get("properties", {})
+        if not isinstance(raw_values, dict):
+            raise ConfigurationError(f"第 {index} 步的 properties 必须是对象")
+        values = {str(key).upper(): str(value) for key, value in raw_values.items()}
+        values["TYPE"] = step_type
+        if step_type not in WORKFLOW_TYPE_BY_KEY:
+            raise ConfigurationError(f"第 {index} 步的类型不支持：{step_type or '未填写'}")
+        _validate_step(index, step_type, values)
+        steps.append(WorkflowStep(index, step_type, values))
     _validate_unique_names(steps)
     return WorkflowTask(file_path.stem, file_path, tuple(steps))
 
