@@ -34,6 +34,10 @@ class ServerParameters:
     password: str | None = None
     key_filename: Path | None = None
     default_open_paths: tuple[str, ...] = ()
+    default_open_commands: tuple[str | None, ...] = ()
+    auth_method: str = "AUTO"
+    default_open_path_index: int | None = None
+    default_open_command_enabled: tuple[bool, ...] = ()
 
     @property
     def target(self) -> str:
@@ -64,6 +68,7 @@ class DeploymentConfig:
     rollback_path: str | None = None
     password: str | None = None
     key_filename: Path | None = None
+    auth_method: str = "AUTO"
 
     @property
     def target(self) -> str:
@@ -81,8 +86,12 @@ _SERVER_REQUIRED_KEYS = (
 )
 
 _SERVER_PARAMETER_KEYS = _SERVER_REQUIRED_KEYS + (
+    "AUTH_METHOD",
     "SOURCE_CODE_PATH",
     "DEFAULT_OPEN_PATH",
+    "DEFAULT_OPEN_COMMAND",
+    "DEFAULT_OPEN_PATH_SELECTED",
+    "DEFAULT_OPEN_COMMAND_ENABLED",
 )
 
 _TASK_KEYS = (
@@ -92,6 +101,9 @@ _TASK_KEYS = (
 _SERVER_ONLY_KEYS = _SERVER_PARAMETER_KEYS + ("PASSWORD", "KEY_FILENAME")
 
 _DEFAULT_OPEN_PATH_PATTERN = re.compile(r"DEFAULT_OPEN_PATH_(\d+)")
+_DEFAULT_OPEN_COMMAND_PATTERN = re.compile(r"DEFAULT_OPEN_COMMAND_(\d+)")
+_DEFAULT_OPEN_PATH_SELECTED_PATTERN = re.compile(r"DEFAULT_OPEN_PATH_SELECTED_(\d+)")
+_DEFAULT_OPEN_COMMAND_ENABLED_PATTERN = re.compile(r"DEFAULT_OPEN_COMMAND_ENABLED_(\d+)")
 
 _REQUIRED_KEYS = _SERVER_REQUIRED_KEYS + _TASK_KEYS
 
@@ -136,6 +148,9 @@ def load_server_parameters(file_path: str | Path) -> ServerParameters:
         for key in values
         if key not in _SERVER_ONLY_KEYS
         and _DEFAULT_OPEN_PATH_PATTERN.fullmatch(key) is None
+        and _DEFAULT_OPEN_COMMAND_PATTERN.fullmatch(key) is None
+        and _DEFAULT_OPEN_PATH_SELECTED_PATTERN.fullmatch(key) is None
+        and _DEFAULT_OPEN_COMMAND_ENABLED_PATTERN.fullmatch(key) is None
     )
     if unexpected_keys:
         raise ConfigurationError(
@@ -156,9 +171,11 @@ def load_server_parameters(file_path: str | Path) -> ServerParameters:
 
     key_value = values.get("KEY_FILENAME", "").strip()
     key_filename = _local_path(key_value) if key_value else None
-    if key_filename is not None and not key_filename.is_file():
+    auth_method = _authentication_method(values, key_filename)
+    if auth_method == "KEY" and key_filename is not None and not key_filename.is_file():
         raise ConfigurationError(f"SSH 私钥不存在：{key_filename}")
 
+    default_open_targets = _default_open_targets(values)
     return ServerParameters(
         name=path.stem,
         file_path=path,
@@ -167,30 +184,93 @@ def load_server_parameters(file_path: str | Path) -> ServerParameters:
         port=port,
         password=_server_password(values.get("PASSWORD", "")),
         key_filename=key_filename,
-        default_open_paths=_default_open_paths(values),
+        default_open_paths=tuple(
+            path for path, _command, _selected, _enabled in default_open_targets
+        ),
+        default_open_commands=tuple(command for _path, command, _selected, _enabled in default_open_targets),
+        auth_method=auth_method,
+        default_open_path_index=next(
+            (index for index, (_path, _command, selected, _enabled) in enumerate(default_open_targets) if selected),
+            None,
+        ),
+        default_open_command_enabled=tuple(
+            enabled for _path, _command, _selected, enabled in default_open_targets
+        ),
     )
 
 
-def _default_open_paths(values: dict[str, str]) -> tuple[str, ...]:
-    paths: list[str] = []
+def _default_open_targets(
+    values: dict[str, str]
+) -> tuple[tuple[str, str | None, bool, bool], ...]:
+    targets: list[tuple[str, str | None, bool, bool]] = []
+
+    def flag(key: str, default: bool = False) -> bool:
+        value = values.get(key, "").strip().upper()
+        if not value:
+            return default
+        if value not in {"YES", "NO"}:
+            raise ConfigurationError(f"{key} 只能填写 YES 或 NO")
+        return value == "YES"
+
     legacy_path = values.get("DEFAULT_OPEN_PATH", "").strip()
+    legacy_command = values.get("DEFAULT_OPEN_COMMAND", "").strip()
+    if legacy_command and not legacy_path:
+        raise ConfigurationError("默认命令缺少对应的默认目录：DEFAULT_OPEN_COMMAND")
+    legacy_selected = flag("DEFAULT_OPEN_PATH_SELECTED")
+    legacy_command_enabled = flag(
+        "DEFAULT_OPEN_COMMAND_ENABLED", bool(legacy_command)
+    )
+    if (legacy_selected or legacy_command_enabled) and not legacy_path:
+        raise ConfigurationError("默认选项缺少对应的默认目录：DEFAULT_OPEN_PATH")
     if legacy_path:
-        paths.append(legacy_path)
-    indexed_paths: list[tuple[int, str]] = []
+        targets.append((
+            legacy_path,
+            legacy_command or None,
+            legacy_selected,
+            legacy_command_enabled,
+        ))
+    indexed_paths: dict[int, str] = {}
+    indexed_commands: dict[int, str] = {}
+    option_indexes: set[int] = set()
     for key, value in values.items():
-        match = _DEFAULT_OPEN_PATH_PATTERN.fullmatch(key)
-        path = value.strip()
+        path_match = _DEFAULT_OPEN_PATH_PATTERN.fullmatch(key)
+        command_match = _DEFAULT_OPEN_COMMAND_PATTERN.fullmatch(key)
+        selected_match = _DEFAULT_OPEN_PATH_SELECTED_PATTERN.fullmatch(key)
+        enabled_match = _DEFAULT_OPEN_COMMAND_ENABLED_PATTERN.fullmatch(key)
+        match = path_match or command_match or selected_match or enabled_match
         if match is None:
             continue
         index_text = match.group(1)
         if int(index_text) <= 0 or index_text != str(int(index_text)):
-            raise ConfigurationError(f"默认目录编号无效：{key}")
-        if path:
-            indexed_paths.append((int(index_text), path))
-    for _index, path in sorted(indexed_paths):
-        if path not in paths:
-            paths.append(path)
-    return tuple(paths)
+            raise ConfigurationError(f"默认目录或命令编号无效：{key}")
+        index = int(index_text)
+        if path_match is not None and value.strip():
+            indexed_paths[index] = value.strip()
+        elif command_match is not None and value.strip():
+            indexed_commands[index] = value.strip()
+        elif selected_match is not None or enabled_match is not None:
+            option_indexes.add(index)
+    path_indexes = set(indexed_paths)
+    orphan_commands = sorted(index for index in indexed_commands if index not in path_indexes)
+    if orphan_commands:
+        keys = ", ".join(f"DEFAULT_OPEN_COMMAND_{index}" for index in orphan_commands)
+        raise ConfigurationError(f"默认命令缺少对应的默认目录：{keys}")
+    for index in sorted(set(indexed_paths) | option_indexes):
+        selected = flag(f"DEFAULT_OPEN_PATH_SELECTED_{index}")
+        enabled = flag(
+            f"DEFAULT_OPEN_COMMAND_ENABLED_{index}",
+            bool(indexed_commands.get(index)),
+        )
+        path = indexed_paths.get(index, "")
+        if (selected or enabled) and not path:
+            raise ConfigurationError(
+                f"默认选项缺少对应的默认目录：DEFAULT_OPEN_PATH_{index}"
+            )
+        if path and all(existing_path != path for existing_path, *_rest in targets):
+            targets.append((path, indexed_commands.get(index), selected, enabled))
+    if sum(1 for _path, _command, selected, _enabled in targets if selected) > 1:
+        raise ConfigurationError("默认访问位置只能选择一个")
+    return tuple(targets)
 
 
 def load_config(file_path: str | Path) -> DeploymentConfig:
@@ -250,7 +330,8 @@ def load_config(file_path: str | Path) -> DeploymentConfig:
 
     key_filename_value = values.get("KEY_FILENAME", "").strip()
     key_filename = _local_path(key_filename_value) if key_filename_value else None
-    if key_filename is not None and not key_filename.is_file():
+    auth_method = _authentication_method(values, key_filename)
+    if auth_method == "KEY" and key_filename is not None and not key_filename.is_file():
         raise ConfigurationError(f"SSH 私钥不存在：{key_filename}")
 
     password = _server_password(values.get("PASSWORD", ""))
@@ -332,7 +413,19 @@ def load_config(file_path: str | Path) -> DeploymentConfig:
         health_check_instance_command=health_check_instance_command,
         rollback_command=rollback_command,
         rollback_path=rollback_path,
+        auth_method=auth_method,
     )
+
+
+def _authentication_method(
+    values: dict[str, str], key_filename: Path | None
+) -> str:
+    method = values.get("AUTH_METHOD", "").strip().upper()
+    if not method:
+        return "KEY" if key_filename is not None else "PASSWORD"
+    if method not in {"PASSWORD", "KEY"}:
+        raise ConfigurationError("AUTH_METHOD 只能填写 PASSWORD 或 KEY")
+    return method
 
 
 def _validate_task_keys(task_values: dict[str, str]) -> None:
@@ -341,6 +434,9 @@ def _validate_task_keys(task_values: dict[str, str]) -> None:
         for key in task_values
         if key in _SERVER_ONLY_KEYS
         or _DEFAULT_OPEN_PATH_PATTERN.fullmatch(key) is not None
+        or _DEFAULT_OPEN_COMMAND_PATTERN.fullmatch(key) is not None
+        or _DEFAULT_OPEN_PATH_SELECTED_PATTERN.fullmatch(key) is not None
+        or _DEFAULT_OPEN_COMMAND_ENABLED_PATTERN.fullmatch(key) is not None
     )
     if misplaced_server_keys:
         raise ConfigurationError(
@@ -383,6 +479,9 @@ def _compose_values(task_path: Path, task_values: dict[str, str]) -> dict[str, s
         for key in task_values
         if key in _SERVER_ONLY_KEYS
         or _DEFAULT_OPEN_PATH_PATTERN.fullmatch(key) is not None
+        or _DEFAULT_OPEN_COMMAND_PATTERN.fullmatch(key) is not None
+        or _DEFAULT_OPEN_PATH_SELECTED_PATTERN.fullmatch(key) is not None
+        or _DEFAULT_OPEN_COMMAND_ENABLED_PATTERN.fullmatch(key) is not None
     )
     if misplaced_task_keys:
         raise ConfigurationError(
@@ -397,6 +496,9 @@ def _compose_values(task_path: Path, task_values: dict[str, str]) -> dict[str, s
         for key in parameter_values
         if key not in _SERVER_ONLY_KEYS
         and _DEFAULT_OPEN_PATH_PATTERN.fullmatch(key) is None
+        and _DEFAULT_OPEN_COMMAND_PATTERN.fullmatch(key) is None
+        and _DEFAULT_OPEN_PATH_SELECTED_PATTERN.fullmatch(key) is None
+        and _DEFAULT_OPEN_COMMAND_ENABLED_PATTERN.fullmatch(key) is None
     )
     if misplaced_parameter_keys:
         raise ConfigurationError(

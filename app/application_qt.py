@@ -16,13 +16,15 @@ import shutil
 import sys
 import threading
 import traceback
+from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QSignalBlocker, QTimer, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSignalBlocker, QTimer, Qt, Signal
 from PySide6.QtGui import QAction, QBrush, QCloseEvent, QColor, QFont, QIcon, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -44,6 +46,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QSplitter,
@@ -89,10 +92,11 @@ _PROPERTY_TOOLTIPS = {
     "USERNAME": "填登录服务器的账号，例如 root、deploy。",
     "PASSWORD": "填这个账号的登录密码；使用私钥登录时可以留空。",
     "KEY_FILENAME": "填私钥文件的完整本地路径，例如 C:\\Keys\\prod.pem。使用密码登录时留空。",
+    "AUTH_METHOD": "选择连接服务器时默认使用密码还是 SSH 私钥；两种认证信息都会继续保留。",
     "DEFAULT_OPEN_PATH": "仅用于手动打开 SSH 终端后自动进入的目录，例如 /opt/app；执行任务时不会使用它。",
+    "DEFAULT_OPEN_COMMAND": "选择对应的默认访问路径后自动执行这条命令，例如 tail -f app.log；不需要自动执行时留空。",
     "PARAMETER_FILE": "选一份服务器配置文件，例如 production.txt。任务会用其中的地址、账号和密码连接服务器。",
     "PROJECT_PATH": "填本机项目所在目录，例如 D:\\code\\my-service；构建或 Git 操作会在这里执行。",
-    "SOURCE_CODE_PATH": "填要上传的本地文件或目录路径。",
     "JAR_FILE": "填要部署的 JAR 文件名，例如 app.jar；不填时程序会自动在 target 目录中寻找。",
     "BUILD_TIMEOUT": "填 Maven 打包最长允许多久，单位秒。普通项目可填 900。",
     "IDEA_PROJECT_PATH": "填 IDEA 中正在开发的项目目录；只有需要自动合并和推送 Git 分支时才填写。",
@@ -204,6 +208,7 @@ class _WorkflowGraphicsView(QGraphicsView):
     _MIN_ZOOM = 0.35
     _MAX_ZOOM = 4.0
     step_clicked = Signal(int)
+    selection_cleared = Signal()
     step_double_clicked = Signal(int)
     step_context_requested = Signal(int, object)
     save_requested = Signal()
@@ -237,13 +242,12 @@ class _WorkflowGraphicsView(QGraphicsView):
         if event.button() == Qt.LeftButton:
             self.setCursor(Qt.OpenHandCursor)
             position = event.position().toPoint()
-            if (
-                self._pressed_step is not None
-                and self._press_position is not None
-                and (position - self._press_position).manhattanLength() < 5
-                and self._step_at(position) == self._pressed_step
-            ):
-                self.step_clicked.emit(self._pressed_step)
+            if self._press_position is not None and (position - self._press_position).manhattanLength() < 5:
+                released_step = self._step_at(position)
+                if self._pressed_step is not None and released_step == self._pressed_step:
+                    self.step_clicked.emit(self._pressed_step)
+                elif self._pressed_step is None and released_step is None:
+                    self.selection_cleared.emit()
             self._pressed_step = None
             self._press_position = None
 
@@ -330,9 +334,12 @@ class _WorkflowDiagramPanel(QWidget):
 
         self.scene = QGraphicsScene(self)
         self.view = _WorkflowGraphicsView(self.scene)
-        self.view.step_clicked.connect(self.step_clicked)
+        self._selected_step: int | None = None
+        self._step_items: dict[int, tuple[object, object, str]] = {}
+        self.view.step_clicked.connect(self._select_step)
+        self.view.selection_cleared.connect(self.clear_selection)
         self.view.step_double_clicked.connect(self.step_double_clicked)
-        self.view.step_context_requested.connect(self.step_context_requested)
+        self.view.step_context_requested.connect(self._show_step_context_menu)
         self.view.save_requested.connect(self.save_requested)
         self.view.zoom_changed.connect(self._zoom_changed)
         self.view.setRenderHint(QPainter.Antialiasing)
@@ -348,10 +355,46 @@ class _WorkflowDiagramPanel(QWidget):
         self._saved_zoom = zoom
         self.zoom_changed.emit(zoom)
 
-    def set_steps(self, steps: list[tuple[int, str]]) -> None:
+    def set_steps(self, steps: list[tuple[int, str]], preserve_view: bool = False) -> None:
+        selected_step = self._selected_step
+        center = self.view.mapToScene(self.view.viewport().rect().center())
         self.scene.clear()
+        self._step_items.clear()
         self._draw(steps)
-        QTimer.singleShot(0, self._fit_scene)
+        self._selected_step = None
+        if selected_step in self._step_items:
+            self._set_selected_step(selected_step)
+        if preserve_view:
+            QTimer.singleShot(0, lambda position=center: self.view.centerOn(position))
+        else:
+            QTimer.singleShot(0, self._fit_scene)
+
+    def _select_step(self, step_index: int) -> None:
+        self._set_selected_step(step_index)
+        self.step_clicked.emit(step_index)
+
+    def selected_step(self) -> int | None:
+        return self._selected_step if self._selected_step in self._step_items else None
+
+    def clear_selection(self) -> None:
+        self._set_selected_step(None)
+
+    def _show_step_context_menu(self, step_index: int, position: object) -> None:
+        self._set_selected_step(step_index)
+        self.step_context_requested.emit(step_index, position)
+
+    def _set_selected_step(self, step_index: int | None) -> None:
+        if self._selected_step in self._step_items:
+            rect, text, color = self._step_items[self._selected_step]
+            rect.setPen(QPen(QColor(color), 2))
+            rect.setBrush(QBrush(QColor("#ffffff")))
+            text.setDefaultTextColor(QColor(color))
+        self._selected_step = step_index
+        if step_index is not None and step_index in self._step_items:
+            rect, text, _color = self._step_items[step_index]
+            rect.setPen(QPen(QColor("#2563eb"), 3))
+            rect.setBrush(QBrush(QColor("#dbeafe")))
+            text.setDefaultTextColor(QColor("#1d4ed8"))
 
     def _draw(self, steps: list[tuple[int, str]]) -> None:
         node_width, node_height = 360, 64
@@ -387,14 +430,452 @@ class _WorkflowDiagramPanel(QWidget):
             if step_index is not None:
                 rect.setData(Qt.UserRole, step_index)
                 text.setData(Qt.UserRole, step_index)
+                self._step_items[step_index] = (rect, text, color)
 
         bottom = top + len(nodes) * (node_height + spacing)
         self.scene.setSceneRect(0, 0, 760, bottom + 40)
 
     def _fit_scene(self) -> None:
+        blocker = QSignalBlocker(self.view)
         self.view.fit_scene()
         if getattr(self, "_saved_zoom", 1.0) != 1.0:
             self.view.zoom(self._saved_zoom)
+        del blocker
+
+
+class _SquareCheckBox(QCheckBox):
+    def paintEvent(self, _event: QEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        color = QColor("#111827" if self.isEnabled() else "#94a3b8")
+        top = max(0, (self.height() - 15) // 2)
+        box = QRect(1, top, 14, 14)
+        painter.setPen(QPen(color, 1))
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        painter.drawRect(box)
+        if self.isChecked():
+            painter.setPen(QPen(color, 2))
+            painter.drawLine(4, top + 7, 7, top + 10)
+            painter.drawLine(7, top + 10, 13, top + 4)
+        painter.setPen(color)
+        painter.drawText(
+            QRect(22, 0, max(0, self.width() - 22), self.height()),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            self.text(),
+        )
+
+
+class _ServerParameterForm(QScrollArea):
+    """Visual editor backed by the existing server parameter text format."""
+
+    content_changed = Signal()
+    direct_connect_requested = Signal(str, str)
+    _FIELDS = (
+        ("IP_ADDRESS", "服务器地址", "例如 192.168.1.20 或 deploy.example.com"),
+        ("PORT", "SSH 端口", "通常为 22"),
+        ("USERNAME", "登录账号", "例如 root 或 deploy"),
+        ("PASSWORD", "登录密码", "使用私钥登录时可以留空"),
+        ("KEY_FILENAME", "SSH 私钥", "本地私钥文件的完整路径，可留空"),
+    )
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._loading = False
+        self._selected_path_row: QFrame | None = None
+        self._path_row_targets: dict[QObject, QFrame] = {}
+        self._path_rows: list[
+            tuple[QFrame, QLabel, QCheckBox, QCheckBox, QLineEdit, QLineEdit]
+        ] = []
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+
+        page = QWidget()
+        root = QVBoxLayout(page)
+        root.setContentsMargins(18, 16, 18, 18)
+        root.setSpacing(14)
+
+        connection_card = QFrame()
+        connection_card.setObjectName("parameterCard")
+        connection_layout = QVBoxLayout(connection_card)
+        connection_layout.addWidget(QLabel("服务器连接"))
+        form = QFormLayout()
+        form.setHorizontalSpacing(18)
+        form.setVerticalSpacing(10)
+        self.controls: dict[str, QLineEdit] = {}
+        self.field_labels: dict[str, QLabel] = {}
+        for key, label_text, placeholder in self._FIELDS:
+            if key == "PASSWORD":
+                auth_mode = QFrame()
+                auth_mode.setObjectName("authModeToggle")
+                auth_mode.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+                auth_mode.setFixedHeight(30)
+                auth_layout = QHBoxLayout(auth_mode)
+                auth_layout.setContentsMargins(0, 0, 0, 0)
+                auth_layout.setSpacing(0)
+                self.password_auth_button = QPushButton("密码登录")
+                self.password_auth_button.setObjectName("passwordAuthButton")
+                self.key_auth_button = QPushButton("私钥登录")
+                self.key_auth_button.setObjectName("keyAuthButton")
+                for button in (self.password_auth_button, self.key_auth_button):
+                    button.setCheckable(True)
+                    button.setFixedSize(88, 28)
+                self.auth_button_group = QButtonGroup(self)
+                self.auth_button_group.setExclusive(True)
+                self.auth_button_group.addButton(self.password_auth_button)
+                self.auth_button_group.addButton(self.key_auth_button)
+                self.password_auth_button.setChecked(True)
+                self.password_auth_button.toggled.connect(self._auth_mode_changed)
+                self.key_auth_button.toggled.connect(self._auth_mode_changed)
+                auth_layout.addWidget(self.password_auth_button)
+                auth_layout.addWidget(self.key_auth_button)
+                auth_mode.setStyleSheet(
+                    "QFrame#authModeToggle { background:#ffffff; border:1px solid #94a3b8; border-radius:4px; }"
+                    "QPushButton { border:0; background:#ffffff; }"
+                    "QPushButton#passwordAuthButton { border-right:1px solid #94a3b8; border-top-left-radius:3px; border-bottom-left-radius:3px; }"
+                    "QPushButton#keyAuthButton { border-top-right-radius:3px; border-bottom-right-radius:3px; }"
+                    "QPushButton:checked { background:#dbeafe; color:#1d4ed8; font-weight:600; }"
+                )
+                form.addRow("认证方式", auth_mode)
+            label = QLabel(label_text)
+            self.field_labels[key] = label
+            tooltip = _PROPERTY_TOOLTIPS.get(key, "")
+            label.setToolTip(tooltip)
+            control = QLineEdit()
+            control.setPlaceholderText(placeholder)
+            control.setToolTip(tooltip)
+            control.textChanged.connect(self._notify_changed)
+            self.controls[key] = control
+            form.addRow(label, control)
+        connection_layout.addLayout(form)
+        root.addWidget(connection_card)
+
+        paths_card = QFrame()
+        paths_card.setObjectName("parameterCard")
+        paths_root = QVBoxLayout(paths_card)
+        paths_header = QHBoxLayout()
+        paths_header.addWidget(QLabel("默认访问位置"))
+        paths_header.addStretch(1)
+        add_path_button = QPushButton("增加路径")
+        add_path_button.clicked.connect(lambda: self._add_path_row(notify=True))
+        paths_header.addWidget(add_path_button)
+        paths_root.addLayout(paths_header)
+        hint = QLabel("连接 SSH 时进入所选目录，并按需自动执行对应命令。命令可以留空。")
+        hint.setObjectName("parameterHint")
+        paths_root.addWidget(hint)
+        self.paths_layout = QVBoxLayout()
+        self.paths_layout.setSpacing(8)
+        paths_root.addLayout(self.paths_layout)
+        root.addWidget(paths_card)
+        root.addStretch(1)
+        self.setWidget(page)
+        self.setStyleSheet(
+            "QScrollArea { background:#f8fafc; border:1px solid #d1d5db; }"
+            "QWidget { background:#f8fafc; }"
+            "QFrame#parameterCard { background:#ffffff; border:1px solid #d1d5db; border-radius:6px; }"
+            "QFrame#parameterCard QLabel { background:#ffffff; }"
+            "QFrame#parameterPathRow { background:#ffffff; border:1px solid transparent; border-radius:4px; }"
+            "QFrame#parameterPathRow[selected=\"true\"] { background:#eff6ff; border:1px solid #2563eb; }"
+            "QLabel#parameterHint { color:#64748b; }"
+            "QLineEdit { min-height:26px; padding:2px 7px; background:#ffffff; border:1px solid #cbd5e1; border-radius:4px; }"
+            "QCheckBox#pathOption { color:#334155; background:#ffffff; border:0; padding:2px 4px; }"
+        )
+
+    def set_content(self, content: str) -> None:
+        values: dict[str, str] = {}
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip().upper()] = value.strip()
+
+        self._loading = True
+        for key, _label, _placeholder in self._FIELDS:
+            self.controls[key].setText(values.get(key, "22" if key == "PORT" else ""))
+        self.controls["PASSWORD"].setReadOnly(
+            values.get("PASSWORD", "") == _HIDDEN_PASSWORD_VALUE
+        )
+        auth_method = values.get("AUTH_METHOD", "").strip().upper()
+        use_private_key = auth_method == "KEY" or (
+            auth_method not in {"PASSWORD", "KEY"}
+            and bool(values.get("KEY_FILENAME", "").strip())
+        )
+        self.key_auth_button.setChecked(use_private_key)
+        self.password_auth_button.setChecked(not use_private_key)
+        self._update_auth_field_visibility()
+        self._clear_path_rows()
+        entries: list[tuple[int, str, str, bool, bool]] = []
+        legacy_path = values.get("DEFAULT_OPEN_PATH", "")
+        legacy_command = values.get("DEFAULT_OPEN_COMMAND", "")
+        if legacy_path or legacy_command:
+            command_enabled_value = values.get("DEFAULT_OPEN_COMMAND_ENABLED", "")
+            entries.append((
+                0,
+                legacy_path,
+                legacy_command,
+                values.get("DEFAULT_OPEN_PATH_SELECTED", "").upper() == "YES",
+                command_enabled_value.upper() == "YES"
+                if command_enabled_value else bool(legacy_command),
+            ))
+        indexed: dict[int, dict[str, str]] = {}
+        for key, value in values.items():
+            path_match = re.fullmatch(r"DEFAULT_OPEN_PATH_(\d+)", key)
+            command_match = re.fullmatch(r"DEFAULT_OPEN_COMMAND_(\d+)", key)
+            selected_match = re.fullmatch(r"DEFAULT_OPEN_PATH_SELECTED_(\d+)", key)
+            enabled_match = re.fullmatch(r"DEFAULT_OPEN_COMMAND_ENABLED_(\d+)", key)
+            if path_match:
+                indexed.setdefault(int(path_match.group(1)), {})["path"] = value
+            elif command_match:
+                indexed.setdefault(int(command_match.group(1)), {})["command"] = value
+            elif selected_match:
+                indexed.setdefault(int(selected_match.group(1)), {})["selected"] = value
+            elif enabled_match:
+                indexed.setdefault(int(enabled_match.group(1)), {})["enabled"] = value
+        for index, pair in sorted(indexed.items()):
+            command = pair.get("command", "")
+            enabled_value = pair.get("enabled", "")
+            entries.append((
+                index,
+                pair.get("path", ""),
+                command,
+                pair.get("selected", "").upper() == "YES",
+                enabled_value.upper() == "YES" if enabled_value else bool(command),
+            ))
+        for _index, path, command, selected, command_enabled in entries:
+            self._add_path_row(path, command, selected, command_enabled)
+        self._loading = False
+
+    def to_content(self) -> str:
+        auth_method = "KEY" if self.key_auth_button.isChecked() else "PASSWORD"
+        lines = [
+            "# 服务器连接配置",
+            f"IP_ADDRESS={self.controls['IP_ADDRESS'].text().strip()}",
+            f"PORT={self.controls['PORT'].text().strip()}",
+            f"USERNAME={self.controls['USERNAME'].text().strip()}",
+            f"AUTH_METHOD={auth_method}",
+            f"PASSWORD={self.controls['PASSWORD'].text()}",
+            f"KEY_FILENAME={self.controls['KEY_FILENAME'].text().strip()}",
+            "",
+            "# 手动连接 SSH 时使用的默认访问位置和可选命令",
+        ]
+        for index, (_row, _label, selected, command_enabled, path, command) in enumerate(
+            self._path_rows, start=1
+        ):
+            lines.append(f"DEFAULT_OPEN_PATH_{index}={path.text().strip()}")
+            lines.append(
+                f"DEFAULT_OPEN_PATH_SELECTED_{index}={'YES' if selected.isChecked() else 'NO'}"
+            )
+            lines.append(f"DEFAULT_OPEN_COMMAND_{index}={command.text().strip()}")
+            lines.append(
+                f"DEFAULT_OPEN_COMMAND_ENABLED_{index}={'YES' if command_enabled.isChecked() else 'NO'}"
+            )
+        return "\n".join(lines).rstrip() + "\n"
+
+    def _add_path_row(
+        self,
+        path: str = "",
+        command: str = "",
+        selected: bool = False,
+        command_enabled: bool = False,
+        notify: bool = False,
+    ) -> None:
+        row = QFrame()
+        row.setObjectName("parameterPathRow")
+        row.setProperty("selected", False)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(6, 5, 6, 5)
+        label = QLabel()
+        selected_check = _SquareCheckBox("默认路径")
+        selected_check.setObjectName("pathOption")
+        selected_check.setChecked(selected)
+        command_enabled_check = _SquareCheckBox("执行命令")
+        command_enabled_check.setObjectName("pathOption")
+        has_command = bool(command.strip())
+        command_enabled_check.setChecked(command_enabled and has_command)
+        command_enabled_check.setEnabled(has_command)
+        path_entry = QLineEdit(path)
+        path_entry.setPlaceholderText("服务器目录，例如 /opt/app")
+        path_entry.setToolTip(_PROPERTY_TOOLTIPS["DEFAULT_OPEN_PATH"])
+        command_entry = QLineEdit(command)
+        command_entry.setPlaceholderText("进入目录后自动执行的命令，可留空")
+        command_entry.setToolTip(_PROPERTY_TOOLTIPS["DEFAULT_OPEN_COMMAND"])
+        direct_connect_button = QPushButton("直接连接")
+        direct_connect_button.setEnabled(bool(path.strip()))
+        direct_connect_button.clicked.connect(
+            lambda _checked=False, target=row: self._request_path_row_connection(target)
+        )
+        remove_button = QPushButton("删除")
+        remove_button.clicked.connect(lambda _checked=False, target=row: self._remove_path_row(target))
+        path_entry.textChanged.connect(
+            lambda value, target=direct_connect_button: self._path_value_changed(
+                target, value
+            )
+        )
+        command_entry.textChanged.connect(
+            lambda value, target=command_enabled_check: self._path_command_changed(
+                target, value
+            )
+        )
+        selected_check.toggled.connect(
+            lambda checked, target=selected_check: self._default_path_toggled(target, checked)
+        )
+        command_enabled_check.toggled.connect(self._notify_changed)
+        layout.addWidget(label)
+        layout.addWidget(selected_check)
+        layout.addWidget(command_enabled_check)
+        layout.addWidget(path_entry, 1)
+        layout.addWidget(command_entry, 1)
+        layout.addWidget(direct_connect_button)
+        layout.addWidget(remove_button)
+        for target in (
+            row,
+            label,
+            selected_check,
+            command_enabled_check,
+            path_entry,
+            command_entry,
+            direct_connect_button,
+            remove_button,
+        ):
+            target.installEventFilter(self)
+            self._path_row_targets[target] = row
+        self.paths_layout.addWidget(row)
+        self._path_rows.append((
+            row, label, selected_check, command_enabled_check, path_entry, command_entry
+        ))
+        self._renumber_path_rows()
+        if selected:
+            self._default_path_toggled(selected_check, True)
+        if notify:
+            self._notify_changed()
+
+    def _remove_path_row(self, target: QFrame) -> None:
+        for row_data in list(self._path_rows):
+            if row_data[0] is target:
+                self._path_rows.remove(row_data)
+                for watched, row in list(self._path_row_targets.items()):
+                    if row is target:
+                        self._path_row_targets.pop(watched, None)
+                if self._selected_path_row is target:
+                    self._selected_path_row = None
+                target.deleteLater()
+                break
+        self._renumber_path_rows()
+        self._notify_changed()
+
+    def _clear_path_rows(self) -> None:
+        for row, _label, _selected, _enabled, _path, _command in self._path_rows:
+            row.deleteLater()
+        self._path_rows.clear()
+        self._path_row_targets.clear()
+        self._selected_path_row = None
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        row = self._path_row_targets.get(watched)
+        if row is not None:
+            if event.type() == QEvent.MouseButtonPress:
+                if event.button() in (Qt.LeftButton, Qt.RightButton):
+                    self._select_path_row(row)
+            elif event.type() == QEvent.MouseButtonDblClick:
+                if event.button() == Qt.LeftButton:
+                    self._select_path_row(row)
+                    self._request_path_row_connection(row)
+                    return True
+            elif event.type() == QEvent.ContextMenu:
+                self._select_path_row(row)
+                self._show_path_row_context_menu(row, event.globalPos())
+                return True
+        return super().eventFilter(watched, event)
+
+    def _select_path_row(self, row: QFrame) -> None:
+        if self._selected_path_row is row:
+            return
+        if self._selected_path_row is not None:
+            self._selected_path_row.setProperty("selected", False)
+            self._refresh_path_row_style(self._selected_path_row)
+        self._selected_path_row = row
+        row.setProperty("selected", True)
+        self._refresh_path_row_style(row)
+
+    @staticmethod
+    def _refresh_path_row_style(row: QFrame) -> None:
+        row.style().unpolish(row)
+        row.style().polish(row)
+        row.update()
+
+    def _show_path_row_context_menu(self, row: QFrame, position: QPoint) -> None:
+        for target, _label, _selected, _enabled, path, command in self._path_rows:
+            if target is not row:
+                continue
+            menu = QMenu(self)
+            menu.setStyleSheet(
+                "QMenu { background:#ffffff; color:#111827; border:1px solid #cbd5e1; }"
+                "QMenu::item { background:transparent; padding:6px 24px; }"
+                "QMenu::item:selected { background:#dbeafe; color:#1d4ed8; }"
+                "QMenu::item:disabled { color:#94a3b8; }"
+            )
+            connect_action = menu.addAction("直接连接")
+            connect_action.setEnabled(bool(path.text().strip()))
+            connect_action.triggered.connect(
+                lambda _checked=False, target=row:
+                self._request_path_row_connection(target)
+            )
+            menu.exec(position)
+            return
+
+    def _request_path_row_connection(self, row: QFrame) -> None:
+        for target, _label, _selected, command_enabled, path, command in self._path_rows:
+            if target is not row:
+                continue
+            command_value = command.text().strip() if command_enabled.isChecked() else ""
+            self.direct_connect_requested.emit(path.text().strip(), command_value)
+            return
+
+    def _renumber_path_rows(self) -> None:
+        for index, (_row, label, _selected, _enabled, _path, _command) in enumerate(
+            self._path_rows, start=1
+        ):
+            label.setText(f"位置 {index}")
+
+    def _default_path_toggled(self, target: QCheckBox, checked: bool) -> None:
+        if checked:
+            for _row, _label, selected, _enabled, _path, _command in self._path_rows:
+                if selected is target:
+                    continue
+                blocker = QSignalBlocker(selected)
+                selected.setChecked(False)
+                del blocker
+        self._notify_changed()
+
+    def _path_command_changed(self, target: QCheckBox, value: str) -> None:
+        has_command = bool(value.strip())
+        if not has_command and target.isChecked():
+            blocker = QSignalBlocker(target)
+            target.setChecked(False)
+            del blocker
+        target.setEnabled(has_command)
+        self._notify_changed()
+
+    def _path_value_changed(self, target: QPushButton, value: str) -> None:
+        target.setEnabled(bool(value.strip()))
+        self._notify_changed()
+
+    def _notify_changed(self, _value: object = None) -> None:
+        if not self._loading:
+            self.content_changed.emit()
+
+    def _auth_mode_changed(self, checked: bool) -> None:
+        if not checked:
+            return
+        self._update_auth_field_visibility()
+        self._notify_changed()
+
+    def _update_auth_field_visibility(self) -> None:
+        password_login = self.password_auth_button.isChecked()
+        self.field_labels["PASSWORD"].setVisible(password_login)
+        self.controls["PASSWORD"].setVisible(password_login)
+        self.field_labels["KEY_FILENAME"].setVisible(not password_login)
+        self.controls["KEY_FILENAME"].setVisible(not password_login)
 
 
 class _PasswordDialog(QDialog):
@@ -448,6 +929,7 @@ class ApplicationWindow(QMainWindow):
                 "tasks、parameters、scripts"
             )
         self.draft_root = configuration_root / ".drafts"
+        self.history_root = configuration_root / ".history"
         self.settings_path = configuration_root / "settings.json"
         self.parameter_template_path = parameter_template_path.resolve()
         self.script_template_path = script_template_path.resolve()
@@ -457,6 +939,14 @@ class ApplicationWindow(QMainWindow):
             "auto_save_delay_seconds", 1.0, 0.5, 30.0
         )
         self.workflow_zoom = self._bounded_float("workflow_zoom", 1.0, 0.35, 4.0)
+        saved_workflow_zooms = self.application_settings.get("workflow_task_zooms", {})
+        self.workflow_task_zooms: dict[str, float] = {}
+        if isinstance(saved_workflow_zooms, dict):
+            for task_name, zoom in saved_workflow_zooms.items():
+                try:
+                    self.workflow_task_zooms[str(task_name)] = min(4.0, max(0.35, float(zoom)))
+                except (TypeError, ValueError):
+                    continue
         startup_page = str(self.application_settings.get("startup_page", "last"))
         saved_view = str(self.application_settings.get("view_mode", "task"))
         self.view_mode = startup_page if startup_page in {"task", "parameter", "script"} else saved_view
@@ -491,6 +981,10 @@ class ApplicationWindow(QMainWindow):
         self.auto_save_timer = QTimer(self)
         self.auto_save_timer.setSingleShot(True)
         self.auto_save_timer.timeout.connect(self._write_current_draft)
+        self.history_timer = QTimer(self)
+        self.history_timer.setSingleShot(True)
+        self.history_timer.setInterval(5 * 60 * 1000)
+        self.history_timer.timeout.connect(self._write_current_history)
         self.setWindowTitle("DeployFlow 自动部署工具")
         self.setMinimumSize(800, 520)
         self.resize(1100, 720)
@@ -565,6 +1059,8 @@ class ApplicationWindow(QMainWindow):
         self.file_list.setDragEnabled(True)
         self.file_list.setAcceptDrops(True)
         self.file_list.setDropIndicatorShown(True)
+        self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.file_list.customContextMenuRequested.connect(self._show_file_context_menu)
         self.file_list.currentItemChanged.connect(self._on_file_selected)
         self.file_list.model().rowsMoved.connect(self._save_file_order)
         side_layout.addWidget(self.file_list, 1)
@@ -625,6 +1121,11 @@ class ApplicationWindow(QMainWindow):
         )
         editor_header.addWidget(self.view_toggle)
         editor_header.addStretch(1)
+        self.history_button = QPushButton("历史版本")
+        self.history_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.history_button.setFixedSize(88, 30)
+        self.history_button.clicked.connect(self._show_current_file_history)
+        editor_header.addWidget(self.history_button)
         editor_layout.addLayout(editor_header)
         self.editor = QPlainTextEdit()
         self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)
@@ -646,9 +1147,15 @@ class ApplicationWindow(QMainWindow):
         self.workflow_panel.save_requested.connect(self.save_text)
         self.workflow_panel.zoom_changed.connect(self._save_workflow_zoom)
         self.workflow_panel.set_zoom(self.workflow_zoom)
+        self.server_parameter_form = _ServerParameterForm()
+        self.server_parameter_form.content_changed.connect(self._parameter_form_changed)
+        self.server_parameter_form.direct_connect_requested.connect(
+            self._direct_ssh_connection
+        )
         self.editor_splitter.addWidget(self.workflow_panel)
+        self.editor_splitter.addWidget(self.server_parameter_form)
         self.editor_splitter.addWidget(self.editor)
-        self.editor_splitter.setSizes([700, 300])
+        self.editor_splitter.setSizes([700, 0, 300])
         editor_layout.addWidget(self.editor_splitter, 1)
         self.parameter_view_button.setChecked(True)
         self.flow_view_button.setChecked(True)
@@ -791,6 +1298,324 @@ class ApplicationWindow(QMainWindow):
             return
         self._load_file(path)
 
+    def _show_file_context_menu(self, position: QPoint) -> None:
+        item = self.file_list.itemAt(position)
+        if item is None:
+            return
+        path = Path(str(item.data(Qt.UserRole))).resolve()
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background:#ffffff; color:#111827; border:1px solid #cbd5e1; }"
+            "QMenu::item { background:transparent; padding:6px 24px; }"
+            "QMenu::item:selected { background:#dbeafe; color:#1d4ed8; }"
+            "QMenu::item:disabled { color:#94a3b8; }"
+        )
+        history_action = menu.addAction("历史版本")
+        history_action.setEnabled(any(self._history_directory(path).glob("*.txt")))
+        history_action.triggered.connect(
+            lambda _checked=False, target=path: self._show_file_history(target)
+        )
+        menu.exec(self.file_list.viewport().mapToGlobal(position))
+
+    def _show_file_history(self, path: Path) -> None:
+        history_mode = self._history_mode(path)
+        view_label = {"task": "任务", "parameter": "配置", "script": "脚本"}[history_mode]
+        if self.current_path == path and self._dirty:
+            if not self._write_current_history():
+                return
+        versions = sorted(self._history_directory(path).glob("*.txt"), reverse=True)
+        if not versions:
+            QMessageBox.information(self, "历史版本", f"当前{view_label}还没有历史版本")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"{view_label}历史版本 - {path.stem}")
+        dialog.resize(760, 500)
+        root = QVBoxLayout(dialog)
+        splitter = QSplitter(Qt.Horizontal)
+        version_list = QListWidget()
+        version_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        select_all_action = QAction(version_list)
+        select_all_action.setShortcut(QKeySequence.SelectAll)
+        select_all_action.setShortcutContext(Qt.WidgetShortcut)
+        select_all_action.triggered.connect(
+            lambda _checked=False: version_list.selectAll()
+        )
+        version_list.addAction(select_all_action)
+        preview = QPlainTextEdit()
+        preview.setReadOnly(True)
+        preview.setFont(QFont("Cascadia Mono", self.editor_font_size))
+        splitter.addWidget(version_list)
+        splitter.addWidget(preview)
+        splitter.setSizes([220, 540])
+        root.addWidget(splitter, 1)
+        actions = QHBoxLayout()
+        restore_button = QPushButton("恢复此版本")
+        delete_button = QPushButton("删除版本")
+        close_button = QPushButton("关闭")
+        actions.addStretch(1)
+        actions.addWidget(restore_button)
+        actions.addWidget(delete_button)
+        actions.addWidget(close_button)
+        root.addLayout(actions)
+
+        def selected_versions() -> list[Path]:
+            return [
+                Path(str(item.data(Qt.UserRole)))
+                for item in version_list.selectedItems()
+            ]
+
+        def selected_version() -> Path | None:
+            versions = selected_versions()
+            return versions[0] if len(versions) == 1 else None
+
+        def show_preview() -> None:
+            selections = selected_versions()
+            delete_button.setEnabled(bool(selections))
+            if not selections:
+                preview.clear()
+                restore_button.setEnabled(False)
+                return
+            if len(selections) > 1:
+                preview.setPlainText(f"已选择 {len(selections)} 个历史版本，可批量删除。")
+                restore_button.setEnabled(False)
+                return
+            version = selections[0]
+            try:
+                preview.setPlainText(
+                    self._history_preview(
+                        version.read_text(encoding="utf-8-sig"), history_mode
+                    )
+                )
+                restore_button.setEnabled(True)
+            except (OSError, UnicodeDecodeError) as exc:
+                preview.setPlainText(f"无法读取历史版本：{exc}")
+                restore_button.setEnabled(False)
+
+        def reload_versions() -> None:
+            version_list.clear()
+            current_versions = sorted(
+                self._history_directory(path).glob("*.txt"), reverse=True
+            )
+            for history_path in current_versions:
+                item = QListWidgetItem(self._history_version_label(history_path))
+                item.setData(Qt.UserRole, str(history_path))
+                version_list.addItem(item)
+            if version_list.count():
+                version_list.setCurrentRow(0)
+            else:
+                show_preview()
+
+        def restore_version() -> None:
+            version = selected_version()
+            if version is None:
+                return
+            if QMessageBox.question(self, "确认恢复", "确定恢复所选历史版本吗？") != QMessageBox.Yes:
+                return
+            try:
+                current_content = path.read_text(encoding="utf-8-sig")
+                restored_content = version.read_text(encoding="utf-8-sig")
+            except (OSError, UnicodeDecodeError) as exc:
+                QMessageBox.critical(self, "恢复失败", str(exc))
+                return
+            if self.current_path == path and self._dirty:
+                if not self._write_current_history():
+                    return
+            elif not self._write_history_snapshot(path, current_content):
+                return
+            try:
+                path.write_text(restored_content, encoding="utf-8")
+            except OSError as exc:
+                QMessageBox.critical(self, "恢复失败", str(exc))
+                return
+            if self.current_path == path:
+                if history_mode == "parameter":
+                    self._close_parameter_ssh_tabs(path)
+                self._delete_draft(path)
+                self._load_file(path)
+            self.status_label.setText(f"已恢复{view_label}：{path.stem}")
+            reload_versions()
+
+        def delete_version() -> None:
+            versions = selected_versions()
+            if not versions:
+                return
+            message = (
+                f"确定删除历史版本“{self._history_version_label(versions[0])}”吗？"
+                if len(versions) == 1
+                else f"确定删除选中的 {len(versions)} 个历史版本吗？"
+            )
+            if QMessageBox.question(
+                self, "确认删除", message
+            ) != QMessageBox.Yes:
+                return
+            failures: list[str] = []
+            for version in versions:
+                try:
+                    version.unlink()
+                except OSError as exc:
+                    failures.append(f"{self._history_version_label(version)}：{exc}")
+            reload_versions()
+            if failures:
+                QMessageBox.critical(self, "部分删除失败", "\n".join(failures))
+            else:
+                self.status_label.setText(f"已删除 {len(versions)} 个历史版本")
+
+        def show_version_context_menu(position: QPoint) -> None:
+            item = version_list.itemAt(position)
+            if item is None:
+                return
+            if not item.isSelected():
+                version_list.clearSelection()
+                version_list.setCurrentItem(item)
+            menu = QMenu(dialog)
+            menu.setStyleSheet(
+                "QMenu { background:#ffffff; color:#111827; border:1px solid #cbd5e1; }"
+                "QMenu::item { background:transparent; padding:6px 24px; }"
+                "QMenu::item:selected { background:#dbeafe; color:#1d4ed8; }"
+            )
+            if len(selected_versions()) == 1:
+                restore_action = menu.addAction("恢复此版本")
+                restore_action.triggered.connect(restore_version)
+                menu.addSeparator()
+            delete_action = menu.addAction("删除此版本")
+            delete_action.triggered.connect(delete_version)
+            menu.exec(version_list.viewport().mapToGlobal(position))
+
+        version_list.itemSelectionChanged.connect(show_preview)
+        version_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        version_list.customContextMenuRequested.connect(show_version_context_menu)
+        restore_button.clicked.connect(restore_version)
+        delete_button.clicked.connect(delete_version)
+        close_button.clicked.connect(dialog.reject)
+        reload_versions()
+        dialog.exec()
+
+    def _show_current_file_history(self) -> None:
+        if self.current_path is not None:
+            self._show_file_history(self.current_path)
+
+    @staticmethod
+    def _history_version_label(path: Path) -> str:
+        try:
+            value = datetime.strptime(path.stem, "%Y%m%d-%H%M%S-%f")
+            return value.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        except ValueError:
+            return path.stem
+
+    @staticmethod
+    def _history_preview(content: str, history_mode: str) -> str:
+        if history_mode == "parameter":
+            return ApplicationWindow._parameter_history_preview(content)
+        try:
+            document = json.loads(content)
+        except json.JSONDecodeError:
+            return content
+        steps = document.get("steps") if isinstance(document, dict) else None
+        if not isinstance(steps, list):
+            return content
+        lines: list[str] = []
+        for index, step in enumerate(steps, start=1):
+            if not isinstance(step, dict):
+                continue
+            definition = WORKFLOW_TYPE_BY_KEY.get(str(step.get("type", "")).upper())
+            lines.append(f"第 {index} 步：{definition.label if definition else step.get('type', '')}")
+            properties = step.get("properties", {})
+            if definition is not None and isinstance(properties, dict):
+                for field in definition.fields:
+                    value = str(properties.get(field.key, "")).strip()
+                    if value:
+                        lines.append(f"  {field.label}：{value}")
+            lines.append("")
+        return "\n".join(lines).rstrip()
+
+    @staticmethod
+    def _parameter_history_preview(content: str) -> str:
+        values: dict[str, str] = {}
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith(("#", ";")) or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            values[key.strip().upper()] = value.strip()
+
+        lines: list[str] = []
+        connection: list[tuple[str, str]] = []
+        for key, label in (
+            ("IP_ADDRESS", "服务器地址"),
+            ("PORT", "SSH 端口"),
+            ("USERNAME", "登录账号"),
+        ):
+            value = values.get(key, "").strip()
+            if value:
+                connection.append((label, value))
+        password = values.get("PASSWORD", "").strip()
+        key_filename = values.get("KEY_FILENAME", "").strip()
+        auth_method = values.get("AUTH_METHOD", "").strip().upper()
+        if auth_method or password or key_filename:
+            if not auth_method:
+                auth_method = "KEY" if key_filename else "PASSWORD"
+            auth_label = {"PASSWORD": "密码登录", "KEY": "SSH 私钥登录", "AUTO": "自动选择"}.get(
+                auth_method, auth_method
+            )
+            connection.append(("认证方式", auth_label))
+        if password:
+            connection.append(("登录密码", "已配置"))
+        if key_filename:
+            connection.append(("SSH 私钥", key_filename))
+        if connection:
+            lines.append("服务器连接")
+            lines.extend(f"  {label}：{value}" for label, value in connection)
+
+        entries: list[tuple[int, str, str, bool, bool]] = []
+        legacy_path = values.get("DEFAULT_OPEN_PATH", "").strip()
+        legacy_command = values.get("DEFAULT_OPEN_COMMAND", "").strip()
+        if legacy_path:
+            legacy_enabled = values.get("DEFAULT_OPEN_COMMAND_ENABLED", "").upper()
+            entries.append((
+                0,
+                legacy_path,
+                legacy_command,
+                values.get("DEFAULT_OPEN_PATH_SELECTED", "").upper() == "YES",
+                legacy_enabled == "YES" if legacy_enabled else bool(legacy_command),
+            ))
+        indexed: dict[int, dict[str, str]] = {}
+        patterns = (
+            (r"DEFAULT_OPEN_PATH_(\d+)", "path"),
+            (r"DEFAULT_OPEN_COMMAND_(\d+)", "command"),
+            (r"DEFAULT_OPEN_PATH_SELECTED_(\d+)", "selected"),
+            (r"DEFAULT_OPEN_COMMAND_ENABLED_(\d+)", "enabled"),
+        )
+        for key, value in values.items():
+            for pattern, field in patterns:
+                match = re.fullmatch(pattern, key)
+                if match:
+                    indexed.setdefault(int(match.group(1)), {})[field] = value
+                    break
+        for index, entry in sorted(indexed.items()):
+            path = entry.get("path", "").strip()
+            if not path:
+                continue
+            command = entry.get("command", "").strip()
+            enabled = entry.get("enabled", "").upper()
+            entries.append((
+                index,
+                path,
+                command,
+                entry.get("selected", "").upper() == "YES",
+                enabled == "YES" if enabled else bool(command),
+            ))
+        for display_index, (_index, path, command, selected, enabled) in enumerate(entries, start=1):
+            if lines:
+                lines.append("")
+            lines.append(f"访问位置 {display_index}")
+            lines.append(f"  服务器目录：{path}")
+            if selected:
+                lines.append("  默认连接路径：是")
+            if command:
+                lines.append(f"  执行命令：{command}")
+                lines.append(f"  连接后自动执行：{'是' if enabled else '否'}")
+        return "\n".join(lines).rstrip()
+
     def _load_structured_workflow(self, content: str) -> bool:
         if self.view_mode != "task":
             return False
@@ -865,6 +1690,7 @@ class ApplicationWindow(QMainWindow):
         return "\n".join(lines).rstrip() + ("\n" if lines else "")
 
     def _load_file(self, path: Path) -> bool:
+        self.history_timer.stop()
         try:
             stored = path.read_text(encoding="utf-8-sig")
             self._structured_workflow_steps = None
@@ -897,6 +1723,12 @@ class ApplicationWindow(QMainWindow):
                 return False
         self.current_path = path.resolve()
         self.last_selected_files[self.view_mode] = path.name
+        if self.view_mode == "task":
+            blocker = QSignalBlocker(self.workflow_panel)
+            self.workflow_panel.set_zoom(
+                self.workflow_task_zooms.get(path.name, self.workflow_zoom)
+            )
+            del blocker
         self._set_editor_content(displayed)
         self.editor.setReadOnly(self._structured_workflow_steps is not None)
         self._dirty = dirty
@@ -912,20 +1744,43 @@ class ApplicationWindow(QMainWindow):
         self._loading_editor = True
         self.editor.setPlainText(content)
         self.editor.document().setModified(False)
+        if self.view_mode == "parameter" and hasattr(self, "server_parameter_form"):
+            self.server_parameter_form.set_content(content)
         if preserve_view:
             cursor.setPosition(min(position, len(content)))
             self.editor.setTextCursor(cursor)
             self.editor.verticalScrollBar().setValue(scroll)
         self._loading_editor = False
-        self._refresh_workflow_diagram()
+        if not preserve_view and hasattr(self, "workflow_panel"):
+            self.workflow_panel.clear_selection()
+        self._refresh_workflow_diagram(preserve_view=preserve_view)
 
     def _editor_changed(self) -> None:
         if self._loading_editor:
             return
+        if not self._dirty and self.current_path is not None:
+            self._ensure_current_history_baseline()
         self._dirty = True
         self._refresh_workflow_diagram()
         self.status_label.setText("内容已修改，等待自动暂存")
         self.auto_save_timer.start(int(self.auto_save_delay_seconds * 1000))
+        if self.current_path is not None:
+            self.history_timer.start()
+
+    def _parameter_form_changed(self) -> None:
+        if self._loading_editor or self.view_mode != "parameter":
+            return
+        self._loading_editor = True
+        self.editor.setPlainText(self.server_parameter_form.to_content())
+        self.editor.document().setModified(True)
+        self._loading_editor = False
+        if not self._dirty and self.current_path is not None:
+            self._ensure_current_history_baseline()
+        self._dirty = True
+        self.status_label.setText("配置已修改，等待自动暂存")
+        self.auto_save_timer.start(int(self.auto_save_delay_seconds * 1000))
+        if self.current_path is not None:
+            self.history_timer.start()
 
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.editor.viewport() and event.type() == QEvent.ToolTip:
@@ -947,7 +1802,7 @@ class ApplicationWindow(QMainWindow):
             step_index = self._workflow_step_at_cursor(cursor)
             if step_index is not None:
                 menu.addSeparator()
-                action = menu.addAction(f"从第 {step_index} 步开始执行")
+                action = menu.addAction("从此位置开始执行")
                 action.triggered.connect(
                     lambda _checked=False, value=step_index: self.develop_method(value)
                 )
@@ -1032,6 +1887,66 @@ class ApplicationWindow(QMainWindow):
         self.status_label.setText("内容已自动暂存，点击保存后生效")
         return True
 
+    def _history_mode(self, path: Path) -> str:
+        parent = path.resolve().parent
+        if parent == self.task_dir:
+            return "task"
+        if parent == self.parameter_dir:
+            return "parameter"
+        if parent == self.script_dir:
+            return "script"
+        return self.view_mode
+
+    def _history_directory(self, path: Path) -> Path:
+        directory = {
+            "task": "tasks", "parameter": "parameters", "script": "scripts"
+        }[self._history_mode(path)]
+        return self.history_root / directory / path.name
+
+    def _ensure_current_history_baseline(self) -> bool:
+        if self.current_path is None:
+            return True
+        try:
+            content = self.current_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeDecodeError) as exc:
+            self.status_label.setText(f"历史版本保存失败：{exc}")
+            return False
+        return self._write_history_snapshot(self.current_path, content)
+
+    def _write_current_history(self) -> bool:
+        if self.current_path is None or not self._dirty:
+            return True
+        try:
+            content = (
+                self._structured_workflow_storage()
+                if self._structured_workflow_steps is not None
+                else self._content_for_storage(self.editor.toPlainText())
+            )
+        except PasswordProtectionError as exc:
+            self.status_label.setText(f"历史版本保存失败：{exc}")
+            return False
+        saved = self._write_history_snapshot(self.current_path, content)
+        if saved:
+            self.status_label.setText(f"{self._view_label()}已自动保存历史版本")
+        return saved
+
+    def _write_history_snapshot(self, path: Path, content: str) -> bool:
+        history_dir = self._history_directory(path)
+        try:
+            history_dir.mkdir(parents=True, exist_ok=True)
+            versions = sorted(history_dir.glob("*.txt"), reverse=True)
+            if versions and versions[0].read_text(encoding="utf-8-sig") == content:
+                return True
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            target = history_dir / f"{timestamp}.txt"
+            temporary = history_dir / f".{timestamp}.tmp"
+            temporary.write_text(content, encoding="utf-8")
+            temporary.replace(target)
+        except (OSError, UnicodeDecodeError) as exc:
+            self.status_label.setText(f"历史版本保存失败：{exc}")
+            return False
+        return True
+
     def _restore_untitled_draft(self) -> None:
         draft = self._draft_path(None)
         if not draft.is_file():
@@ -1051,6 +1966,8 @@ class ApplicationWindow(QMainWindow):
     def _confirm_pending_changes(self) -> bool:
         if not self._dirty:
             return True
+        if not self._write_current_history():
+            return False
         answer = QMessageBox.question(
             self,
             "存在未保存内容",
@@ -1064,6 +1981,7 @@ class ApplicationWindow(QMainWindow):
             return self.save_text()
         self._delete_draft(self.current_path)
         self._dirty = False
+        self.history_timer.stop()
         return True
 
     def create_file(self) -> None:
@@ -1132,6 +2050,11 @@ class ApplicationWindow(QMainWindow):
         self._delete_draft(path)
         if self.view_mode == "parameter":
             self._close_parameter_ssh_tabs(path)
+        elif self.view_mode == "task" and path.name in self.workflow_task_zooms:
+            self.workflow_task_zooms[target.name] = self.workflow_task_zooms.pop(path.name)
+            settings = dict(self.application_settings)
+            settings["workflow_task_zooms"] = dict(self.workflow_task_zooms)
+            self._write_settings(settings)
         self.update_file_list(target)
         self._load_file(target)
         self.status_label.setText(f"已重命名为 {target.name}" + (f"，并更新 {len(refs)} 个任务引用" if refs else ""))
@@ -1184,6 +2107,10 @@ class ApplicationWindow(QMainWindow):
         self._delete_draft(path)
         if self.view_mode == "parameter":
             self._close_parameter_ssh_tabs(path)
+        elif self.view_mode == "task" and self.workflow_task_zooms.pop(path.name, None) is not None:
+            settings = dict(self.application_settings)
+            settings["workflow_task_zooms"] = dict(self.workflow_task_zooms)
+            self._write_settings(settings)
         self.current_path = None
         self.last_selected_files.pop(self.view_mode, None)
         self._set_editor_content("")
@@ -1209,6 +2136,9 @@ class ApplicationWindow(QMainWindow):
                 QMessageBox.critical(self, "无法保存", f"文件已存在：{file_name}")
                 return False
         was_dirty = self._dirty
+        if was_dirty and self.current_path is not None:
+            if not self._write_current_history():
+                return False
         try:
             content = (
                 self._structured_workflow_storage()
@@ -1230,6 +2160,7 @@ class ApplicationWindow(QMainWindow):
         self._dirty = False
         self.editor.document().setModified(False)
         self.auto_save_timer.stop()
+        self.history_timer.stop()
         self.status_label.setText(f"已保存 {path.stem}")
         self._update_controls()
         if show_message:
@@ -1347,7 +2278,7 @@ class ApplicationWindow(QMainWindow):
         if legacy:
             self._add_legacy_restart_step()
         else:
-            self._add_workflow_step()
+            self._add_workflow_step(insert_after=self.workflow_panel.selected_step())
 
     def _workflow_steps_from_editor(self) -> list[tuple[int, str]]:
         if self._structured_workflow_steps is not None:
@@ -1363,9 +2294,11 @@ class ApplicationWindow(QMainWindow):
             )
         ])
 
-    def _refresh_workflow_diagram(self) -> None:
+    def _refresh_workflow_diagram(self, preserve_view: bool = True) -> None:
         if hasattr(self, "workflow_panel"):
-            self.workflow_panel.set_steps(self._workflow_steps_from_editor())
+            self.workflow_panel.set_steps(
+                self._workflow_steps_from_editor(), preserve_view=preserve_view
+            )
 
     def _focus_workflow_step(self, step_index: int) -> None:
         if self.view_mode != "task":
@@ -1408,7 +2341,7 @@ class ApplicationWindow(QMainWindow):
         if self.view_mode != "task" or self._deploying:
             return
         menu = QMenu(self)
-        action = menu.addAction(f"从第 {step_index} 步开始执行")
+        action = menu.addAction("从此位置开始执行")
         action.triggered.connect(
             lambda _checked=False, value=step_index: self.develop_method(value)
         )
@@ -1416,20 +2349,36 @@ class ApplicationWindow(QMainWindow):
 
     def _sync_editor_display(self, _checked: bool = False) -> None:
         task_view = self.view_mode == "task"
-        show_editor = not task_view or self.parameter_view_button.isChecked()
+        parameter_view = self.view_mode == "parameter"
+        show_editor = self.view_mode == "script" or (
+            task_view and self.parameter_view_button.isChecked()
+        )
         show_flow = task_view and self.flow_view_button.isChecked()
         self.editor.setVisible(show_editor)
         self.workflow_panel.setVisible(show_flow)
-        if show_editor and show_flow:
-            self.editor_splitter.setSizes([700, 300])
+        self.server_parameter_form.setVisible(parameter_view)
+        if parameter_view:
+            self.editor_splitter.setSizes([0, 1000, 0])
+        elif show_editor and show_flow:
+            self.editor_splitter.setSizes([700, 0, 300])
+        elif show_flow:
+            self.editor_splitter.setSizes([1000, 0, 0])
+        elif show_editor:
+            self.editor_splitter.setSizes([0, 0, 1000])
 
     def _save_workflow_zoom(self, zoom: float) -> None:
-        self.workflow_zoom = zoom
         settings = dict(self.application_settings)
-        settings["workflow_zoom"] = zoom
+        if self.view_mode == "task" and self.current_path is not None:
+            self.workflow_task_zooms[self.current_path.name] = zoom
+            settings["workflow_task_zooms"] = dict(self.workflow_task_zooms)
+        else:
+            self.workflow_zoom = zoom
+            settings["workflow_zoom"] = zoom
         self._write_settings(settings)
 
-    def _add_workflow_step(self, step_index: int | None = None) -> None:
+    def _add_workflow_step(
+        self, step_index: int | None = None, insert_after: int | None = None
+    ) -> None:
         if step_index is None and self._structured_workflow_steps is None and not self.editor.toPlainText().strip():
             self._structured_workflow_steps = []
         existing_values = self._workflow_step_values(step_index) if step_index is not None else {}
@@ -1529,6 +2478,7 @@ class ApplicationWindow(QMainWindow):
         indexes = [int(value) for value in re.findall(r"(?mi)^\s*STEP_(\d+)_TYPE\s*=", self.editor.toPlainText())]
         index = (
             step_index if step_index is not None
+            else insert_after + 1 if insert_after is not None
             else len(self._structured_workflow_steps) + 1
             if self._structured_workflow_steps is not None
             else max(indexes, default=0) + 1
@@ -1544,16 +2494,35 @@ class ApplicationWindow(QMainWindow):
                     if values[field.key] or field.required
                 },
             }
-            if step_index is None:
-                self._structured_workflow_steps.append(step_object)
-            else:
+            if step_index is not None:
                 self._structured_workflow_steps[step_index - 1] = step_object
-            self._set_editor_content(self._structured_workflow_summary(), preserve_view=True)
+            elif insert_after is not None:
+                self._structured_workflow_steps.insert(insert_after, step_object)
+            else:
+                self._structured_workflow_steps.append(step_object)
+            content = self._structured_workflow_summary()
             self.editor.setReadOnly(True)
             status = f"已暂存第 {index} 步：{definition.label}"
-        elif step_index is None:
+        elif step_index is None and insert_after is None:
             updated = self.editor.toPlainText().rstrip()
             content = (updated + "\n\n" if updated else "") + "\n".join(block) + "\n"
+            status = f"已暂存第 {index} 个流程步骤：{definition.label}"
+        elif step_index is None:
+            content = self.editor.toPlainText()
+            for old_index in sorted({value for value in indexes if value >= index}, reverse=True):
+                content = re.sub(
+                    rf"(?mi)^(\s*)STEP_{old_index}_",
+                    rf"\1STEP_{old_index + 1}_",
+                    content,
+                )
+            lines = content.splitlines()
+            previous_step = re.compile(
+                rf"^\s*STEP_{insert_after}_[A-Z][A-Z0-9_]*\s*=", re.IGNORECASE
+            )
+            positions = [line_index for line_index, line in enumerate(lines) if previous_step.match(line)]
+            insert_at = positions[-1] + 1 if positions else len(lines)
+            lines[insert_at:insert_at] = ["", *block]
+            content = "\n".join(lines).rstrip() + "\n"
             status = f"已暂存第 {index} 个流程步骤：{definition.label}"
         else:
             lines = self.editor.toPlainText().splitlines()
@@ -1595,9 +2564,13 @@ class ApplicationWindow(QMainWindow):
         self._mark_changed(f"已暂存第 {index} 个执行步骤")
 
     def _mark_changed(self, status: str) -> None:
+        if not self._dirty and self.current_path is not None:
+            self._ensure_current_history_baseline()
         self._dirty = True
         self.editor.document().setModified(True)
         self._write_current_draft()
+        if self.current_path is not None:
+            self.history_timer.start()
         self.status_label.setText(status + "，点击保存后生效")
 
     def develop_method(self, start_step: int | None = None) -> None:
@@ -1631,11 +2604,8 @@ class ApplicationWindow(QMainWindow):
                     workflow_task.file_path,
                     steps,
                 )
-                confirmation = (
-                    f"任务：{workflow_task.name}\n从第 {start_step} 步开始，共执行 {len(steps)} 个步骤。\n\n"
-                    "此前步骤将被跳过；如果当前步骤依赖此前建立的连接或产物，执行会直接报错。\n\n"
-                    "确定执行吗？"
-                )
+                self._start_workflow(workflow_task, start_step)
+                return
             else:
                 confirmation = f"任务：{workflow_task.name}\n共 {len(workflow_task.steps)} 个步骤\n\n确定执行吗？"
             if QMessageBox.question(self, "确认执行", confirmation) != QMessageBox.Yes:
@@ -1677,7 +2647,7 @@ class ApplicationWindow(QMainWindow):
         self._update_controls()
 
     def _start_workflow(self, task: WorkflowTask, start_step: int | None = None) -> None:
-        start_message = f"从第 {start_step} 步开始执行\n" if start_step is not None else ""
+        start_message = "从此位置开始执行\n" if start_step is not None else ""
         self._prepare_execution(f"执行任务：{task.name}\n{start_message}共 {len(task.steps)} 个步骤，将按配置顺序执行")
         self.status_label.setText("正在执行……")
         threading.Thread(target=self._workflow_worker, args=(task,), name="workflow-worker", daemon=True).start()
@@ -1779,11 +2749,23 @@ class ApplicationWindow(QMainWindow):
         self.log_text.ensureCursorVisible()
 
     def _toggle_ssh_connection(self) -> None:
+        self._open_ssh_connection()
+
+    def _direct_ssh_connection(self, path: str, command: str) -> None:
+        path = path.strip()
+        if not path:
+            return
+        self._open_ssh_connection(path, command.strip() or None)
+
+    def _open_ssh_connection(
+        self,
+        direct_path: str | None = None,
+        direct_command: str | None = None,
+    ) -> None:
         if self.view_mode != "parameter" or self.current_path is None:
             QMessageBox.warning(self, "无法连接", "请在“配置”页面选择服务器配置文件")
             return
-        if self._dirty:
-            QMessageBox.warning(self, "配置尚未保存", "当前配置只有暂存内容，请先保存")
+        if self._dirty and not self.save_text(show_message=False):
             return
         try:
             parameters = load_server_parameters(self.current_path)
@@ -1791,16 +2773,23 @@ class ApplicationWindow(QMainWindow):
             QMessageBox.critical(self, "服务器配置错误", str(exc))
             return
         default_path: str | None = None
-        if len(parameters.default_open_paths) == 1:
-            default_path = parameters.default_open_paths[0]
-        elif len(parameters.default_open_paths) > 1:
-            value, accepted = QInputDialog.getItem(self, "选择默认目录", "请选择本次 SSH 连接进入的目录：", list(parameters.default_open_paths), 0, False)
-            if not accepted:
-                return
-            default_path = value
+        default_command: str | None = None
+        if direct_path is not None:
+            default_path = direct_path
+            default_command = direct_command
+        else:
+            selected_index = parameters.default_open_path_index
+            if selected_index is not None and selected_index < len(parameters.default_open_paths):
+                default_path = parameters.default_open_paths[selected_index]
+                command_enabled = (
+                    selected_index < len(parameters.default_open_command_enabled)
+                    and parameters.default_open_command_enabled[selected_index]
+                )
+                if command_enabled and selected_index < len(parameters.default_open_commands):
+                    default_command = parameters.default_open_commands[selected_index]
         parameter_path = self.current_path.resolve()
         tab = QtSSHTerminalTab(
-            self.interaction_tabs, parameters, parameter_path, default_path,
+            self.interaction_tabs, parameters, parameter_path, default_path, default_command,
             self._on_ssh_state_changed, self._close_ssh_tab,
         )
         tabs = self.ssh_tabs.setdefault(parameter_path, [])
@@ -1890,6 +2879,8 @@ class ApplicationWindow(QMainWindow):
         self.password_button.setEnabled(not self._deploying and (not self._password_hiding_enabled() or self.current_path is not None))
         self.connect_button.setEnabled(not self._deploying and self.view_mode == "parameter" and self.current_path is not None)
         self.add_step_button.setVisible(self.view_mode == "task")
+        self.history_button.setVisible(True)
+        self.history_button.setEnabled(not self._deploying and self.current_path is not None)
         for button in (self.parameter_view_button, self.flow_view_button):
             button.setVisible(self.view_mode == "task")
             button.setEnabled(not self._deploying)
@@ -2331,6 +3322,7 @@ class ApplicationWindow(QMainWindow):
         settings.update({
             "editor_font_size": self.editor_font_size,
             "workflow_zoom": self.workflow_zoom,
+            "workflow_task_zooms": dict(self.workflow_task_zooms),
             "view_mode": self.view_mode,
             "selected_files": dict(self.last_selected_files),
             "window_state": "zoomed" if self.isMaximized() else "normal",

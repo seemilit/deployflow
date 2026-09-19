@@ -124,12 +124,21 @@ class FabricDeployer:
             raise DeploymentError("缺少 Fabric，请先执行：pip install fabric") from exc
 
         connect_kwargs: dict[str, Any] = {}
-        if config.password:
-            connect_kwargs["password"] = config.password
+        if config.auth_method == "PASSWORD":
             connect_kwargs["allow_agent"] = False
             connect_kwargs["look_for_keys"] = False
-        if config.key_filename:
-            connect_kwargs["key_filename"] = str(config.key_filename)
+            if config.password:
+                connect_kwargs["password"] = config.password
+        elif config.auth_method == "KEY":
+            if config.key_filename:
+                connect_kwargs["key_filename"] = str(config.key_filename)
+        else:
+            if config.password:
+                connect_kwargs["password"] = config.password
+                connect_kwargs["allow_agent"] = False
+                connect_kwargs["look_for_keys"] = False
+            if config.key_filename:
+                connect_kwargs["key_filename"] = str(config.key_filename)
 
         connection = Connection(
             host=config.ip_address,

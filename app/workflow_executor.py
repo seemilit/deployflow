@@ -173,14 +173,22 @@ class WorkflowExecutor:
             raise WorkflowExecutionError("缺少 Fabric，请先安装 requirements.txt") from exc
 
         connect_kwargs: dict[str, Any] = {}
-        if parameters.password:
-            connect_kwargs.update(
-                password=parameters.password,
-                allow_agent=False,
-                look_for_keys=False,
-            )
-        if parameters.key_filename:
-            connect_kwargs["key_filename"] = str(parameters.key_filename)
+        if parameters.auth_method == "PASSWORD":
+            connect_kwargs.update(allow_agent=False, look_for_keys=False)
+            if parameters.password:
+                connect_kwargs["password"] = parameters.password
+        elif parameters.auth_method == "KEY":
+            if parameters.key_filename:
+                connect_kwargs["key_filename"] = str(parameters.key_filename)
+        else:
+            if parameters.password:
+                connect_kwargs.update(
+                    password=parameters.password,
+                    allow_agent=False,
+                    look_for_keys=False,
+                )
+            if parameters.key_filename:
+                connect_kwargs["key_filename"] = str(parameters.key_filename)
         connection = Connection(
             host=parameters.ip_address,
             port=parameters.port,

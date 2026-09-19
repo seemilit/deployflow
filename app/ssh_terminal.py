@@ -97,6 +97,7 @@ class InteractiveSSHSession:
         self,
         parameters: ServerParameters,
         initial_directory: str | None = None,
+        initial_command: str | None = None,
     ) -> None:
         try:
             import paramiko
@@ -182,12 +183,21 @@ class InteractiveSSHSession:
             "allow_agent": True,
             "look_for_keys": True,
         }
-        if parameters.password:
-            connect_arguments["password"] = parameters.password
+        if parameters.auth_method == "PASSWORD":
             connect_arguments["allow_agent"] = False
             connect_arguments["look_for_keys"] = False
-        if parameters.key_filename:
-            connect_arguments["key_filename"] = str(parameters.key_filename)
+            if parameters.password:
+                connect_arguments["password"] = parameters.password
+        elif parameters.auth_method == "KEY":
+            if parameters.key_filename:
+                connect_arguments["key_filename"] = str(parameters.key_filename)
+        else:
+            if parameters.password:
+                connect_arguments["password"] = parameters.password
+                connect_arguments["allow_agent"] = False
+                connect_arguments["look_for_keys"] = False
+            if parameters.key_filename:
+                connect_arguments["key_filename"] = str(parameters.key_filename)
 
         try:
             client.connect(**connect_arguments)
@@ -214,6 +224,10 @@ class InteractiveSSHSession:
                     'exec "${SHELL:-/bin/bash}" -l'
                 )
                 channel.exec_command(startup_command)
+                if initial_command and initial_command.strip():
+                    channel.sendall(
+                        (initial_command.rstrip("\r\n") + "\n").encode("utf-8")
+                    )
             else:
                 channel = client.invoke_shell(
                     term="xterm-256color",

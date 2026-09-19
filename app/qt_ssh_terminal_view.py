@@ -67,6 +67,13 @@ class _ThreadEvents(QObject):
 class _TerminalOutput(QPlainTextEdit):
     keyPressed = Signal(object)
 
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.KeyPress and event.key() == Qt.Key_Tab:
+            self.keyPressed.emit(event)
+            event.accept()
+            return True
+        return super().event(event)
+
     def keyPressEvent(self, event: QKeyEvent) -> None:
         self.keyPressed.emit(event)
 
@@ -402,6 +409,7 @@ class QtSSHTerminalTab(QWidget):
         parameters: ServerParameters,
         parameter_path: Path,
         default_open_path: str | None,
+        default_open_command: str | None,
         state_changed: StateCallback,
         close_requested: CloseCallback,
     ) -> None:
@@ -409,6 +417,7 @@ class QtSSHTerminalTab(QWidget):
         self.parameters = parameters
         self.parameter_path = parameter_path.resolve()
         self.default_open_path = default_open_path
+        self.default_open_command = default_open_command
         self._state_changed = state_changed
         self._close_requested = close_requested
         self._state = "disconnected"
@@ -512,6 +521,14 @@ class QtSSHTerminalTab(QWidget):
     def eventFilter(self, watched: QObject, event: QEvent) -> bool:
         if watched is self.command_entry and event.type() == QEvent.KeyPress:
             key = event.key()
+            if key == Qt.Key_Tab and self.connected:
+                pending = self.command_entry.text()
+                if pending:
+                    self._send_raw(pending)
+                    self.command_entry.clear()
+                self._send_raw("\t")
+                self.output_text.setFocus()
+                return True
             if key == Qt.Key_Up:
                 self._history_previous()
                 return True
@@ -573,7 +590,11 @@ class QtSSHTerminalTab(QWidget):
 
     def _connect_worker(self, session: InteractiveSSHSession, attempt: int) -> None:
         try:
-            session.connect(self.parameters, self.default_open_path)
+            session.connect(
+                self.parameters,
+                self.default_open_path,
+                self.default_open_command,
+            )
         except SSHSessionError as exc:
             self._queue_event("connect_error", (attempt, session, str(exc)))
         except Exception as exc:
