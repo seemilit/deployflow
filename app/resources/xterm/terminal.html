@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="xterm.css">
+  <style>
+    html, body, #terminal {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #111827;
+    }
+    .xterm { padding: 6px 8px; box-sizing: border-box; }
+    .xterm-viewport { scrollbar-color: #64748b #111827; }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+  <script src="xterm.js"></script>
+  <script src="addon-fit.js"></script>
+  <script src="addon-webgl.js"></script>
+  <script>
+    new QWebChannel(qt.webChannelTransport, function (channel) {
+      const bridge = channel.objects.terminalBridge;
+      const term = new Terminal({
+        allowProposedApi: false,
+        convertEol: false,
+        cursorBlink: true,
+        cursorStyle: 'block',
+        drawBoldTextInBrightColors: true,
+        fontFamily: 'Cascadia Mono, Consolas, Microsoft YaHei UI, monospace',
+        fontSize: 14,
+        fontWeight: 'normal',
+        fontWeightBold: 'bold',
+        letterSpacing: 0,
+        lineHeight: 1.1,
+        minimumContrastRatio: 1,
+        scrollback: 10000,
+        smoothScrollDuration: 0,
+        theme: {
+          background: '#111827', foreground: '#e5e7eb', cursor: '#d1d5db',
+          cursorAccent: '#111827', selectionBackground: '#315a84',
+          black: '#111827', red: '#ef4444', green: '#22c55e', yellow: '#eab308',
+          blue: '#3b82f6', magenta: '#d946ef', cyan: '#06b6d4', white: '#e5e7eb',
+          brightBlack: '#64748b', brightRed: '#f87171', brightGreen: '#4ade80',
+          brightYellow: '#facc15', brightBlue: '#60a5fa', brightMagenta: '#e879f9',
+          brightCyan: '#22d3ee', brightWhite: '#f9fafb'
+        }
+      });
+      const fitAddon = new FitAddon.FitAddon();
+      term.loadAddon(fitAddon);
+      term.open(document.getElementById('terminal'));
+      try {
+        const webglAddon = new WebglAddon.WebglAddon();
+        webglAddon.onContextLoss(function () { webglAddon.dispose(); });
+        term.loadAddon(webglAddon);
+      } catch (error) {
+        console.info('WebGL renderer unavailable; using canvas renderer.', error);
+      }
+
+      let fitFrame = 0;
+      function fitTerminal() {
+        cancelAnimationFrame(fitFrame);
+        fitFrame = requestAnimationFrame(function () {
+          const container = document.getElementById('terminal');
+          if (container.clientWidth < 100 || container.clientHeight < 60) return;
+          try { fitAddon.fit(); } catch (error) { console.error(error); }
+        });
+      }
+
+      term.onData(function (data) { bridge.sendInput(data); });
+      term.parser.registerOscHandler(777, function (data) {
+        const match = /^DeployFlowShell;([0-9a-f]{32});([0-9]{1,10})$/.exec(data);
+        if (!match) return false;
+        const pid = Number(match[2]);
+        if (pid > 1 && pid <= 2147483647) bridge.identifyShell(match[1], pid);
+        return true;
+      });
+      term.onBinary(function (data) { bridge.sendBinary(btoa(data)); });
+      term.onResize(function (size) { bridge.resizeTerminal(size.cols, size.rows); });
+      term.onSelectionChange(function () { bridge.updateSelection(term.getSelection()); });
+      term.attachCustomKeyEventHandler(function (event) {
+        if (event.type !== 'keydown' || !event.ctrlKey) return true;
+        const key = event.key.toLowerCase();
+        if (key === 'c' && term.hasSelection()) {
+          bridge.copyText(term.getSelection());
+          return false;
+        }
+        if (key === 'v') {
+          bridge.requestPaste();
+          return false;
+        }
+        return true;
+      });
+
+      bridge.writeRequested.connect(function (data) { term.write(data); });
+      bridge.clearRequested.connect(function () { term.clear(); });
+      bridge.focusRequested.connect(function () { term.focus(); });
+      bridge.fitRequested.connect(fitTerminal);
+      bridge.pasteTextRequested.connect(function (data) { term.paste(data); });
+      new ResizeObserver(fitTerminal).observe(document.getElementById('terminal'));
+      window.addEventListener('focus', function () { term.focus(); });
+      fitTerminal();
+      term.focus();
+      bridge.terminalReady();
+    });
+  </script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+xterm.js 5.5.0
+@xterm/addon-fit 0.10.0
+@xterm/addon-webgl 0.18.0
+
+The corresponding MIT license texts are stored beside these files.

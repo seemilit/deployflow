@@ -25,7 +25,7 @@ if not exist "%~dp0app\qt_main.pyw" (
 )
 
 echo 正在检查打包环境...
-"%PYTHON_EXE%" -c "import cx_Freeze, fabric, paramiko, pyte, PySide6" >nul 2>nul
+"%PYTHON_EXE%" -c "import cx_Freeze, fabric, paramiko, pyte, PySide6; from PySide6 import QtWebChannel, QtWebEngineWidgets" >nul 2>nul
 if errorlevel 1 (
     echo [错误] 打包环境不完整，缺少 cx_Freeze 或项目依赖。
     echo 请执行："%PYTHON_EXE%" -m pip install -r requirements.txt

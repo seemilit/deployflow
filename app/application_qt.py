@@ -11,6 +11,7 @@ import hmac
 import json
 import math
 import os
+import queue
 import re
 import shutil
 import sys
@@ -20,7 +21,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QSignalBlocker, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QCloseEvent, QColor, QFont, QIcon, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF, QTextCursor, QWheelEvent
+from PySide6.QtGui import QAction, QBrush, QCloseEvent, QColor, QContextMenuEvent, QFont, QIcon, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPen, QPolygonF, QTextCursor, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -46,6 +47,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRubberBand,
     QScrollArea,
     QSizePolicy,
     QSpinBox,
@@ -77,6 +79,9 @@ from workflow_executor import WorkflowExecutor
 _PASSWORD_LINE_PATTERN = re.compile(
     r"^(?P<prefix>[ \t]*PASSWORD[ \t]*=[ \t]*)(?P<value>.*?)(?P<suffix>[ \t]*)$",
     re.IGNORECASE | re.MULTILINE,
+)
+_ANSI_ESCAPE_PATTERN = re.compile(
+    r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~]|[@-_])"
 )
 _HIDDEN_PASSWORD_VALUE = "********"
 _SCRIPT_EXTENSIONS = {
@@ -202,15 +207,99 @@ class _WorkerSignals(QObject):
     finished = Signal(str, object)
 
 
+class _ParameterLogWriter(QObject):
+    appended = Signal(object, str, int)
+    failed = Signal(str)
+
+    def __init__(self, parent: QObject) -> None:
+        super().__init__(parent)
+        self._queue: queue.Queue[tuple[Path, str, str, int] | None] = queue.Queue()
+        self._sequence_lock = threading.Lock()
+        self._io_lock = threading.Lock()
+        self._next_sequence = 0
+        self._committed_sequences: dict[Path, int] = {}
+        self.write_error: str | None = None
+        self._closed = False
+        self._thread = threading.Thread(
+            target=self._run,
+            name="parameter-log-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def append(self, log_path: Path, event_type: str, value: str) -> None:
+        with self._sequence_lock:
+            if self._closed or not value:
+                return
+            self._next_sequence += 1
+            sequence = self._next_sequence
+            self._queue.put((log_path, event_type, value, sequence))
+
+    def read_text(self, log_path: Path) -> tuple[str, int]:
+        with self._io_lock:
+            content = log_path.read_text(encoding="utf-8-sig")
+            sequence = self._committed_sequences.get(log_path, 0)
+        return content, sequence
+
+    def shutdown(self) -> None:
+        with self._sequence_lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._queue.put(None)
+
+    def is_finished(self) -> bool:
+        return not self._thread.is_alive()
+
+    @staticmethod
+    def _format(event_type: str, value: str) -> str:
+        if event_type == "output":
+            text = _ANSI_ESCAPE_PATTERN.sub("", value)
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+            return "".join(
+                character
+                for character in text
+                if character in "\n\t" or ord(character) >= 32
+            )
+        if event_type == "command":
+            return f"\n[执行命令] {value.strip()}\n"
+        return f"\n[{event_type}] {value.strip()}\n"
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                log_path, event_type, value, sequence = item
+                text = self._format(event_type, value)
+                if not text:
+                    continue
+                with self._io_lock:
+                    with log_path.open("a", encoding="utf-8") as stream:
+                        stream.write(text)
+                    self._committed_sequences[log_path] = sequence
+                self.appended.emit(log_path, text, sequence)
+            except (OSError, UnicodeError) as exc:
+                self.write_error = str(exc)
+                self.failed.emit(self.write_error)
+            finally:
+                self._queue.task_done()
+
+
 class _WorkflowGraphicsView(QGraphicsView):
     """Scrollable workflow canvas with cursor-centered wheel zoom."""
 
     _MIN_ZOOM = 0.35
     _MAX_ZOOM = 4.0
-    step_clicked = Signal(int)
+    step_clicked = Signal(int, bool)
+    steps_box_selected = Signal(object, bool)
     selection_cleared = Signal()
     step_double_clicked = Signal(int)
     step_context_requested = Signal(int, object)
+    step_drag_target_changed = Signal(int, object)
+    step_drag_finished = Signal()
+    step_move_requested = Signal(int, int)
     save_requested = Signal()
     zoom_changed = Signal(float)
 
@@ -219,39 +308,224 @@ class _WorkflowGraphicsView(QGraphicsView):
         self._zoom_factor = 1.0
         self._pressed_step: int | None = None
         self._press_position: QPoint | None = None
+        self._drag_offset = QPoint()
+        self._dragging_step = False
+        self._pan_origin: QPoint | None = None
+        self._pan_position: QPoint | None = None
+        self._panning = False
+        self._rubber_origin: QPoint | None = None
+        self._rubber_band = QRubberBand(QRubberBand.Rectangle, self.viewport())
+        self._drag_badge = QLabel(self.viewport())
+        self._drag_badge.setStyleSheet(
+            "QLabel { background: rgba(255, 247, 237, 220); color: #9a3412; "
+            "border: 2px solid #f97316; border-radius: 8px; padding: 4px; }"
+        )
+        self._drag_badge.setAlignment(Qt.AlignCenter)
+        self._drag_badge.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._drag_badge.hide()
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.AnchorViewCenter)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setDragMode(QGraphicsView.ScrollHandDrag)
+        self.setDragMode(QGraphicsView.NoDrag)
         self.setInteractive(False)
         self.setFocusPolicy(Qt.StrongFocus)
-        self.setCursor(Qt.OpenHandCursor)
-        self.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._request_context_menu)
+        self.setMouseTracking(True)
+        self.viewport().setMouseTracking(True)
+        self._set_canvas_cursor(Qt.OpenHandCursor)
+        self.setContextMenuPolicy(Qt.DefaultContextMenu)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.RightButton:
+            self._pan_origin = event.position().toPoint()
+            self._pan_position = self._pan_origin
+            self._panning = False
+            self.setFocus(Qt.MouseFocusReason)
+            self._set_canvas_cursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
         if event.button() == Qt.LeftButton:
+            if self._pan_origin is not None:
+                event.accept()
+                return
+            self._dragging_step = False
             self._pressed_step = self._step_at(event.position().toPoint())
             self._press_position = event.position().toPoint()
-            self.setCursor(Qt.ClosedHandCursor)
+            if self._pressed_step is None:
+                self._rubber_origin = self._press_position
+                self._rubber_band.setGeometry(
+                    QRect(self._rubber_origin, self._rubber_origin)
+                )
+                self._rubber_band.show()
+                self._set_canvas_cursor(Qt.CrossCursor)
+            else:
+                drag_visual = self._step_visual(self._pressed_step)
+                if drag_visual is not None:
+                    label, visual_rect = drag_visual
+                    self._drag_badge.setText(label)
+                    self._drag_badge.setGeometry(visual_rect)
+                    self._drag_offset = self._press_position - visual_rect.topLeft()
+                self._set_canvas_cursor(Qt.ArrowCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        super().mouseReleaseEvent(event)
-        if event.button() == Qt.LeftButton:
-            self.setCursor(Qt.OpenHandCursor)
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._pan_origin is not None and event.buttons() & Qt.RightButton:
             position = event.position().toPoint()
+            if (
+                not self._panning
+                and (position - self._pan_origin).manhattanLength()
+                >= QApplication.startDragDistance()
+            ):
+                self._panning = True
+            if self._panning and self._pan_position is not None:
+                delta = position - self._pan_position
+                horizontal = self.horizontalScrollBar()
+                vertical = self.verticalScrollBar()
+                horizontal.setValue(horizontal.value() - delta.x())
+                vertical.setValue(vertical.value() - delta.y())
+                self._pan_position = position
+            self._set_canvas_cursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        if self._rubber_origin is not None and event.buttons() & Qt.LeftButton:
+            self._rubber_band.setGeometry(
+                QRect(self._rubber_origin, event.position().toPoint()).normalized()
+            )
+            self._set_canvas_cursor(Qt.CrossCursor)
+            event.accept()
+            return
+        if (
+            self._pressed_step is not None
+            and self._press_position is not None
+            and event.buttons() & Qt.LeftButton
+            and (
+                event.position().toPoint() - self._press_position
+            ).manhattanLength() >= 5
+        ):
+            self._dragging_step = True
+            scroll_bar = self.verticalScrollBar()
+            cursor_y = event.position().toPoint().y()
+            if cursor_y < 28:
+                scroll_bar.setValue(scroll_bar.value() - 22)
+            elif cursor_y > self.viewport().height() - 28:
+                scroll_bar.setValue(scroll_bar.value() + 22)
+            target_step = self._drop_target_at(event.position().toPoint())
+            if target_step == self._pressed_step:
+                target_step = None
+            self.step_drag_target_changed.emit(self._pressed_step, target_step)
+            badge_position = event.position().toPoint() - self._drag_offset
+            badge_position.setX(min(
+                max(4, badge_position.x()),
+                self.viewport().width() - self._drag_badge.width() - 4,
+            ))
+            badge_position.setY(min(
+                max(4, badge_position.y()),
+                self.viewport().height() - self._drag_badge.height() - 4,
+            ))
+            self._drag_badge.move(badge_position)
+            self._drag_badge.show()
+            self._drag_badge.raise_()
+            self._set_canvas_cursor(Qt.SizeVerCursor)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+        if not event.buttons() & Qt.LeftButton:
+            self._set_canvas_cursor(
+                Qt.ArrowCursor
+                if self._step_at(event.position().toPoint()) is not None
+                else Qt.OpenHandCursor
+            )
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.RightButton:
+            position = event.position().toPoint()
+            clicked = self._pan_origin is not None and not self._panning
+            self._pan_origin = None
+            self._pan_position = None
+            self._panning = False
+            self._set_canvas_cursor(
+                Qt.ArrowCursor
+                if self._step_at(position) is not None
+                else Qt.OpenHandCursor
+            )
+            event.accept()
+            if clicked:
+                self._request_context_menu(position)
+            return
+        if event.button() == Qt.LeftButton:
+            position = event.position().toPoint()
+            if self._dragging_step and self._pressed_step is not None:
+                target_step = self._drop_target_at(position)
+                source_step = self._pressed_step
+                self._drag_badge.hide()
+                self.step_drag_finished.emit()
+                self._dragging_step = False
+                self._pressed_step = None
+                self._press_position = None
+                self._set_canvas_cursor(
+                    Qt.ArrowCursor
+                    if self._step_at(position) is not None
+                    else Qt.OpenHandCursor
+                )
+                if target_step is not None and target_step != source_step:
+                    self.step_move_requested.emit(source_step, target_step)
+                event.accept()
+                return
+            if self._rubber_origin is not None:
+                selection_rect = QRect(self._rubber_origin, position).normalized()
+                self._rubber_band.hide()
+                self._rubber_origin = None
+                additive = bool(event.modifiers() & Qt.ControlModifier)
+                if selection_rect.width() < 5 and selection_rect.height() < 5:
+                    if not additive:
+                        self.selection_cleared.emit()
+                else:
+                    scene_rect = self.mapToScene(selection_rect).boundingRect()
+                    selected_steps = sorted({
+                        step_index
+                        for item in self.scene().items()
+                        for step_index in [item.data(Qt.UserRole)]
+                        if isinstance(step_index, int)
+                        and item.sceneBoundingRect().intersects(scene_rect)
+                    })
+                    self.steps_box_selected.emit(selected_steps, additive)
+                self._pressed_step = None
+                self._press_position = None
+                self._set_canvas_cursor(
+                    Qt.ArrowCursor
+                    if self._step_at(position) is not None
+                    else Qt.OpenHandCursor
+                )
+                event.accept()
+                return
+            self._set_canvas_cursor(
+                Qt.ArrowCursor
+                if self._step_at(position) is not None
+                else Qt.OpenHandCursor
+            )
             if self._press_position is not None and (position - self._press_position).manhattanLength() < 5:
                 released_step = self._step_at(position)
                 if self._pressed_step is not None and released_step == self._pressed_step:
-                    self.step_clicked.emit(self._pressed_step)
+                    additive = bool(event.modifiers() & Qt.ControlModifier)
+                    self.step_clicked.emit(self._pressed_step, additive)
                 elif self._pressed_step is None and released_step is None:
                     self.selection_cleared.emit()
             self._pressed_step = None
             self._press_position = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _set_canvas_cursor(self, cursor: Qt.CursorShape) -> None:
+        self.setCursor(cursor)
+        self.viewport().setCursor(cursor)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.RightButton:
+            self.mousePressEvent(event)
+            return
         if event.button() == Qt.LeftButton:
             step_index = self._step_at(event.position().toPoint())
             if step_index is not None:
@@ -260,10 +534,16 @@ class _WorkflowGraphicsView(QGraphicsView):
                 return
         super().mouseDoubleClickEvent(event)
 
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        # Mouse menus are opened on release only when no panning occurred.
+        if event.reason() == QContextMenuEvent.Keyboard:
+            self._request_context_menu(event.pos())
+        event.accept()
+
     def _request_context_menu(self, position: QPoint) -> None:
         step_index = self._step_at(position)
         if step_index is not None:
-            self.step_context_requested.emit(step_index, self.mapToGlobal(position))
+            self.step_context_requested.emit(step_index, self.viewport().mapToGlobal(position))
 
     def _step_at(self, position: QPoint) -> int | None:
         item = self.itemAt(position)
@@ -271,6 +551,40 @@ class _WorkflowGraphicsView(QGraphicsView):
             return None
         step_index = item.data(Qt.UserRole)
         return step_index if isinstance(step_index, int) else None
+
+    def _step_visual(self, step_index: int) -> tuple[str, QRect] | None:
+        candidates = [
+            item
+            for item in self.scene().items()
+            if item.data(Qt.UserRole) == step_index
+        ]
+        if not candidates:
+            return None
+        node_item = max(
+            candidates,
+            key=lambda item: item.sceneBoundingRect().width()
+            * item.sceneBoundingRect().height(),
+        )
+        visual_rect = self.mapFromScene(node_item.sceneBoundingRect()).boundingRect()
+        label = node_item.toolTip() or f"第 {step_index} 步"
+        return label, visual_rect
+
+    def _drop_target_at(self, position: QPoint) -> int | None:
+        step_index = self._step_at(position)
+        if step_index is not None:
+            return step_index
+        scene_y = self.mapToScene(position).y()
+        positions: dict[int, float] = {}
+        for item in self.scene().items():
+            value = item.data(Qt.UserRole)
+            if isinstance(value, int):
+                positions[value] = item.sceneBoundingRect().center().y()
+        preceding = [
+            (center_y, value)
+            for value, center_y in positions.items()
+            if center_y <= scene_y
+        ]
+        return max(preceding)[1] if preceding else None
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         delta = event.angleDelta().y()
@@ -322,8 +636,11 @@ class _WorkflowDiagramPanel(QWidget):
         "REMOTE_SCRIPT": "#d97706",
     }
     step_clicked = Signal(int)
+    selection_changed = Signal(object)
+    selection_cleared = Signal()
     step_double_clicked = Signal(int)
     step_context_requested = Signal(int, object)
+    step_move_requested = Signal(int, int)
     save_requested = Signal()
     zoom_changed = Signal(float)
 
@@ -334,12 +651,19 @@ class _WorkflowDiagramPanel(QWidget):
 
         self.scene = QGraphicsScene(self)
         self.view = _WorkflowGraphicsView(self.scene)
-        self._selected_step: int | None = None
+        self._selected_steps: set[int] = set()
+        self._drag_source_step: int | None = None
+        self._drag_target_step: int | None = None
+        self._drag_indicator = None
         self._step_items: dict[int, tuple[object, object, str]] = {}
         self.view.step_clicked.connect(self._select_step)
-        self.view.selection_cleared.connect(self.clear_selection)
+        self.view.steps_box_selected.connect(self._select_steps)
+        self.view.selection_cleared.connect(self._clear_selection_from_view)
         self.view.step_double_clicked.connect(self.step_double_clicked)
         self.view.step_context_requested.connect(self._show_step_context_menu)
+        self.view.step_drag_target_changed.connect(self._set_drag_target)
+        self.view.step_drag_finished.connect(self._finish_step_drag)
+        self.view.step_move_requested.connect(self.step_move_requested)
         self.view.save_requested.connect(self.save_requested)
         self.view.zoom_changed.connect(self._zoom_changed)
         self.view.setRenderHint(QPainter.Antialiasing)
@@ -356,45 +680,117 @@ class _WorkflowDiagramPanel(QWidget):
         self.zoom_changed.emit(zoom)
 
     def set_steps(self, steps: list[tuple[int, str]], preserve_view: bool = False) -> None:
-        selected_step = self._selected_step
+        selected_steps = set(self._selected_steps)
         center = self.view.mapToScene(self.view.viewport().rect().center())
         self.scene.clear()
         self._step_items.clear()
+        self._drag_source_step = None
+        self._drag_target_step = None
+        self._drag_indicator = None
         self._draw(steps)
-        self._selected_step = None
-        if selected_step in self._step_items:
-            self._set_selected_step(selected_step)
+        self._selected_steps.clear()
+        self._set_selected_steps(selected_steps)
         if preserve_view:
             QTimer.singleShot(0, lambda position=center: self.view.centerOn(position))
         else:
             QTimer.singleShot(0, self._fit_scene)
 
-    def _select_step(self, step_index: int) -> None:
-        self._set_selected_step(step_index)
+    def _select_step(self, step_index: int, additive: bool) -> None:
+        selected_steps = set(self._selected_steps)
+        if additive:
+            if step_index in selected_steps:
+                selected_steps.remove(step_index)
+            else:
+                selected_steps.add(step_index)
+        else:
+            selected_steps = {step_index}
+        self._set_selected_steps(selected_steps)
         self.step_clicked.emit(step_index)
+        self.selection_changed.emit(self.selected_steps())
+
+    def _select_steps(self, step_indexes: object, additive: bool) -> None:
+        selected_steps = {
+            int(value) for value in step_indexes
+        } if isinstance(step_indexes, (list, tuple, set)) else set()
+        if additive:
+            selected_steps.update(self._selected_steps)
+        self._set_selected_steps(selected_steps)
+        self.selection_changed.emit(self.selected_steps())
 
     def selected_step(self) -> int | None:
-        return self._selected_step if self._selected_step in self._step_items else None
+        steps = self.selected_steps()
+        return max(steps) if steps else None
+
+    def selected_steps(self) -> list[int]:
+        return sorted(step for step in self._selected_steps if step in self._step_items)
 
     def clear_selection(self) -> None:
-        self._set_selected_step(None)
+        self._set_selected_steps(set())
+
+    def set_selected_steps(self, step_indexes: list[int] | tuple[int, ...]) -> None:
+        self._set_selected_steps(set(step_indexes))
+        self.selection_changed.emit(self.selected_steps())
+
+    def _clear_selection_from_view(self) -> None:
+        self.clear_selection()
+        self.selection_changed.emit([])
+        self.selection_cleared.emit()
 
     def _show_step_context_menu(self, step_index: int, position: object) -> None:
-        self._set_selected_step(step_index)
+        if step_index not in self._selected_steps:
+            self._set_selected_steps({step_index})
+            self.selection_changed.emit(self.selected_steps())
         self.step_context_requested.emit(step_index, position)
 
-    def _set_selected_step(self, step_index: int | None) -> None:
-        if self._selected_step in self._step_items:
-            rect, text, color = self._step_items[self._selected_step]
-            rect.setPen(QPen(QColor(color), 2))
-            rect.setBrush(QBrush(QColor("#ffffff")))
-            text.setDefaultTextColor(QColor(color))
-        self._selected_step = step_index
-        if step_index is not None and step_index in self._step_items:
-            rect, text, _color = self._step_items[step_index]
-            rect.setPen(QPen(QColor("#2563eb"), 3))
-            rect.setBrush(QBrush(QColor("#dbeafe")))
-            text.setDefaultTextColor(QColor("#1d4ed8"))
+    def _set_selected_steps(self, step_indexes: set[int]) -> None:
+        self._selected_steps = {
+            step_index for step_index in step_indexes if step_index in self._step_items
+        }
+        self._apply_step_styles()
+
+    def _set_drag_target(self, source_step: int, target_step: object) -> None:
+        self._drag_source_step = source_step
+        self._drag_target_step = target_step if isinstance(target_step, int) else None
+        self._apply_step_styles()
+
+    def _finish_step_drag(self) -> None:
+        self._drag_source_step = None
+        self._drag_target_step = None
+        self._apply_step_styles()
+
+    def _apply_step_styles(self) -> None:
+        if self._drag_indicator is not None:
+            self.scene.removeItem(self._drag_indicator)
+            self._drag_indicator = None
+        for step_index, (rect, text, color) in self._step_items.items():
+            if step_index == self._drag_target_step:
+                rect.setPen(QPen(QColor("#d97706"), 3))
+                rect.setBrush(QBrush(QColor("#fef3c7")))
+                text.setDefaultTextColor(QColor("#92400e"))
+            elif step_index in self._selected_steps:
+                rect.setPen(QPen(QColor("#2563eb"), 3))
+                rect.setBrush(QBrush(QColor("#dbeafe")))
+                text.setDefaultTextColor(QColor("#1d4ed8"))
+            else:
+                rect.setPen(QPen(QColor(color), 2))
+                rect.setBrush(QBrush(QColor("#ffffff")))
+                text.setDefaultTextColor(QColor(color))
+            opacity = 0.42 if step_index == self._drag_source_step else 1.0
+            rect.setOpacity(opacity)
+            text.setOpacity(opacity)
+        if self._drag_target_step in self._step_items:
+            target_rect = self._step_items[self._drag_target_step][0].sceneBoundingRect()
+            indicator_y = target_rect.bottom() + 24
+            indicator_pen = QPen(QColor("#f97316"), 4)
+            indicator_pen.setCapStyle(Qt.RoundCap)
+            self._drag_indicator = self.scene.addLine(
+                target_rect.left() + 12,
+                indicator_y,
+                target_rect.right() - 12,
+                indicator_y,
+                indicator_pen,
+            )
+            self._drag_indicator.setZValue(20)
 
     def _draw(self, steps: list[tuple[int, str]]) -> None:
         node_width, node_height = 360, 64
@@ -424,6 +820,8 @@ class _WorkflowDiagramPanel(QWidget):
             path.addRoundedRect(center_x - node_width / 2, y, node_width, node_height, 10, 10)
             rect = self.scene.addPath(path, QPen(QColor(color), 2), QBrush(QColor("#ffffff")))
             text = self.scene.addText(label, QFont("Microsoft YaHei", 10))
+            rect.setCursor(Qt.ArrowCursor)
+            text.setCursor(Qt.ArrowCursor)
             text.setDefaultTextColor(QColor(color))
             text.setPos(center_x - text.boundingRect().width() / 2, y + 19)
             rect.setToolTip(label)
@@ -930,6 +1328,8 @@ class ApplicationWindow(QMainWindow):
             )
         self.draft_root = configuration_root / ".drafts"
         self.history_root = configuration_root / ".history"
+        self.execution_log_root = configuration_root / ".logs"
+        self.execution_log_root.mkdir(parents=True, exist_ok=True)
         self.settings_path = configuration_root / "settings.json"
         self.parameter_template_path = parameter_template_path.resolve()
         self.script_template_path = script_template_path.resolve()
@@ -939,6 +1339,15 @@ class ApplicationWindow(QMainWindow):
             "auto_save_delay_seconds", 1.0, 0.5, 30.0
         )
         self.workflow_zoom = self._bounded_float("workflow_zoom", 1.0, 0.35, 4.0)
+        self.ssh_monitor_panel_width = self._bounded_int(
+            "ssh_monitor_panel_width", 275, 220, 400
+        )
+        self.ssh_console_height = self._bounded_int(
+            "ssh_console_height", 380, 160, 900
+        )
+        self.file_sidebar_width = self._bounded_int(
+            "file_sidebar_width", 250, 190, 700
+        )
         saved_workflow_zooms = self.application_settings.get("workflow_task_zooms", {})
         self.workflow_task_zooms: dict[str, float] = {}
         if isinstance(saved_workflow_zooms, dict):
@@ -949,12 +1358,12 @@ class ApplicationWindow(QMainWindow):
                     continue
         startup_page = str(self.application_settings.get("startup_page", "last"))
         saved_view = str(self.application_settings.get("view_mode", "task"))
-        self.view_mode = startup_page if startup_page in {"task", "parameter", "script"} else saved_view
-        if self.view_mode not in {"task", "parameter", "script"}:
+        self.view_mode = startup_page if startup_page in {"task", "parameter", "script", "log"} else saved_view
+        if self.view_mode not in {"task", "parameter", "script", "log"}:
             self.view_mode = "task"
         saved_files = self.application_settings.get("selected_files", {})
         self.last_selected_files = (
-            {key: str(value) for key, value in saved_files.items() if key in {"task", "parameter", "script"} and value}
+            {key: str(value) for key, value in saved_files.items() if key in {"task", "parameter", "script", "log"} and value}
             if isinstance(saved_files, dict) else {}
         )
         self.current_path: Path | None = None
@@ -966,10 +1375,20 @@ class ApplicationWindow(QMainWindow):
         self._stop_requested = False
         self._execution_cancel_event = threading.Event()
         self._interaction_panel_user_hidden = False
+        self._ssh_tool_mode = False
+        self._ssh_tool_restore_main_sizes: list[int] = []
+        self._ssh_tool_restore_right_sizes: list[int] = []
+        self._ssh_tool_restore_interaction_visible = False
         self._password_session_unlocked = False
         self._parameter_password_visible = False
         self._parameter_password_ciphertext: str | None = None
         self._visible_parameter_password: str | None = None
+        self._active_execution_log: Path | None = None
+        self._active_execution_task_path: Path | None = None
+        self._active_parameter_log: Path | None = None
+        self._active_parameter_path: Path | None = None
+        self._displayed_log_sequences: dict[Path, int] = {}
+        self._execution_log_write_failed = False
         self.ssh_tabs: dict[Path, list[QtSSHTerminalTab]] = {}
         self._ssh_tab_sequence: dict[Path, int] = {}
         self._ssh_tab_names: dict[QtSSHTerminalTab, str] = {}
@@ -978,6 +1397,13 @@ class ApplicationWindow(QMainWindow):
         self.worker_signals.status.connect(self._set_worker_status)
         self.worker_signals.progress.connect(self._update_progress)
         self.worker_signals.finished.connect(self._worker_finished)
+        self._parameter_log_writer = _ParameterLogWriter(self)
+        self._parameter_log_writer.appended.connect(self._parameter_log_appended)
+        self._parameter_log_writer.failed.connect(self._parameter_log_failed)
+        self._closing_for_logs = False
+        self._log_shutdown_timer = QTimer(self)
+        self._log_shutdown_timer.setInterval(50)
+        self._log_shutdown_timer.timeout.connect(self._poll_log_shutdown)
         self.auto_save_timer = QTimer(self)
         self.auto_save_timer.setSingleShot(True)
         self.auto_save_timer.timeout.connect(self._write_current_draft)
@@ -985,6 +1411,10 @@ class ApplicationWindow(QMainWindow):
         self.history_timer.setSingleShot(True)
         self.history_timer.setInterval(5 * 60 * 1000)
         self.history_timer.timeout.connect(self._write_current_history)
+        self.layout_save_timer = QTimer(self)
+        self.layout_save_timer.setSingleShot(True)
+        self.layout_save_timer.setInterval(400)
+        self.layout_save_timer.timeout.connect(self._save_layout_dimensions)
         self.setWindowTitle("DeployFlow 自动部署工具")
         self.setMinimumSize(800, 520)
         self.resize(1100, 720)
@@ -1022,22 +1452,22 @@ class ApplicationWindow(QMainWindow):
         self.interaction_button.clicked.connect(self._toggle_interaction_panel)
         toolbar.addWidget(self.interaction_button)
         self.execute_button = QPushButton("执行")
-        self.execute_button.clicked.connect(self.develop_method)
+        self.execute_button.clicked.connect(self._execute_selected_or_all)
         toolbar.addWidget(self.execute_button)
         root_layout.addLayout(toolbar)
 
         self.main_splitter = QSplitter(Qt.Horizontal)
-        sidebar = QFrame()
-        sidebar.setObjectName("fileSidebar")
-        sidebar.setMinimumWidth(190)
-        side_layout = QHBoxLayout(sidebar)
+        self.sidebar = QFrame()
+        self.sidebar.setObjectName("fileSidebar")
+        self.sidebar.setMinimumWidth(190)
+        side_layout = QHBoxLayout(self.sidebar)
         side_layout.setContentsMargins(0, 0, 0, 0)
         side_layout.setSpacing(0)
         nav_layout = QVBoxLayout()
         nav_layout.setContentsMargins(0, 0, 0, 0)
         nav_layout.setSpacing(0)
         self.nav_buttons: dict[str, QPushButton] = {}
-        for mode, text in (("task", "任务"), ("parameter", "配置"), ("script", "脚本")):
+        for mode, text in (("task", "任务"), ("parameter", "配置"), ("script", "脚本"), ("log", "日志")):
             button = QPushButton(text)
             button.setObjectName("viewModeButton")
             button.setCheckable(True)
@@ -1059,12 +1489,25 @@ class ApplicationWindow(QMainWindow):
         self.file_list.setDragEnabled(True)
         self.file_list.setAcceptDrops(True)
         self.file_list.setDropIndicatorShown(True)
+        self.file_list.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+            if self.view_mode == "log"
+            else QAbstractItemView.SingleSelection
+        )
+        self.select_all_logs_action = QAction(self.file_list)
+        self.select_all_logs_action.setShortcut(QKeySequence.SelectAll)
+        self.select_all_logs_action.setShortcutContext(Qt.WidgetShortcut)
+        self.select_all_logs_action.setEnabled(self.view_mode == "log")
+        self.select_all_logs_action.triggered.connect(
+            lambda _checked=False: self.file_list.selectAll()
+        )
+        self.file_list.addAction(self.select_all_logs_action)
         self.file_list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self._show_file_context_menu)
         self.file_list.currentItemChanged.connect(self._on_file_selected)
         self.file_list.model().rowsMoved.connect(self._save_file_order)
         side_layout.addWidget(self.file_list, 1)
-        sidebar.setStyleSheet(
+        self.sidebar.setStyleSheet(
             "QFrame#fileSidebar { background:#e5e7eb; border:1px solid #4b5563; }"
             "QPushButton#viewModeButton { background:#e5e7eb; border:0; color:#111827; "
             "font-weight:600; padding:8px; text-align:left; }"
@@ -1078,11 +1521,11 @@ class ApplicationWindow(QMainWindow):
             "QListWidget#fileList::item { min-height:26px; padding:0 8px; }"
             "QListWidget#fileList::item:selected { background:#dbeafe; color:#111827; }"
         )
-        self.main_splitter.addWidget(sidebar)
+        self.main_splitter.addWidget(self.sidebar)
 
         self.right_splitter = QSplitter(Qt.Vertical)
-        editor_container = QWidget()
-        editor_layout = QVBoxLayout(editor_container)
+        self.editor_container = QWidget()
+        editor_layout = QVBoxLayout(self.editor_container)
         editor_layout.setContentsMargins(0, 0, 0, 0)
         editor_header = QHBoxLayout()
         self.add_step_button = QPushButton("增加步骤")
@@ -1141,9 +1584,10 @@ class ApplicationWindow(QMainWindow):
         self.editor.textChanged.connect(self._editor_changed)
         self.editor_splitter = QSplitter(Qt.Horizontal)
         self.workflow_panel = _WorkflowDiagramPanel()
-        self.workflow_panel.step_clicked.connect(self._focus_workflow_step)
+        self.workflow_panel.selection_changed.connect(self._focus_workflow_steps)
         self.workflow_panel.step_double_clicked.connect(self._edit_workflow_step)
         self.workflow_panel.step_context_requested.connect(self._show_workflow_step_context_menu)
+        self.workflow_panel.step_move_requested.connect(self._move_workflow_step)
         self.workflow_panel.save_requested.connect(self.save_text)
         self.workflow_panel.zoom_changed.connect(self._save_workflow_zoom)
         self.workflow_panel.set_zoom(self.workflow_zoom)
@@ -1160,10 +1604,10 @@ class ApplicationWindow(QMainWindow):
         self.parameter_view_button.setChecked(True)
         self.flow_view_button.setChecked(True)
         self._sync_editor_display()
-        self.right_splitter.addWidget(editor_container)
+        self.right_splitter.addWidget(self.editor_container)
 
         self.interaction_tabs = QTabWidget()
-        self.interaction_tabs.setTabsClosable(True)
+        self.interaction_tabs.setTabsClosable(False)
         self.interaction_tabs.tabCloseRequested.connect(self._tab_close_requested)
         output_container = QWidget()
         output_layout = QVBoxLayout(output_container)
@@ -1175,12 +1619,18 @@ class ApplicationWindow(QMainWindow):
         self.log_text.setStyleSheet("QPlainTextEdit { background:#111827; color:#e5e7eb; border:0; padding:8px; }")
         output_layout.addWidget(self.log_text)
         self.interaction_tabs.addTab(output_container, "执行输出")
-        self.interaction_tabs.tabBar().setTabButton(0, QTabBar.RightSide, None)
+        self._refresh_ssh_tab_buttons()
         self.right_splitter.addWidget(self.interaction_tabs)
-        self.right_splitter.setSizes([520, 200])
+        self.right_splitter.setStretchFactor(0, 1)
+        self.right_splitter.setStretchFactor(1, 0)
+        self.right_splitter.splitterMoved.connect(self._layout_dimension_changed)
+        self.right_splitter.setSizes([370, self.ssh_console_height])
         self.interaction_tabs.setVisible(False)
         self.main_splitter.addWidget(self.right_splitter)
-        self.main_splitter.setSizes([250, 850])
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.splitterMoved.connect(self._layout_dimension_changed)
+        self.main_splitter.setSizes([self.file_sidebar_width, 850])
         root_layout.addWidget(self.main_splitter, 1)
 
         status_row = QHBoxLayout()
@@ -1208,13 +1658,18 @@ class ApplicationWindow(QMainWindow):
 
     @property
     def dir_path(self) -> Path:
-        return {"task": self.task_dir, "parameter": self.parameter_dir, "script": self.script_dir}[self.view_mode]
+        return {
+            "task": self.task_dir,
+            "parameter": self.parameter_dir,
+            "script": self.script_dir,
+            "log": self.execution_log_root,
+        }[self.view_mode]
 
     def _view_label(self) -> str:
-        return {"task": "任务", "parameter": "配置", "script": "脚本"}[self.view_mode]
+        return {"task": "任务", "parameter": "配置", "script": "脚本", "log": "日志"}[self.view_mode]
 
     def switch_view(self, view_mode: str, initial: bool = False) -> None:
-        if view_mode not in {"task", "parameter", "script"}:
+        if view_mode not in {"task", "parameter", "script", "log"}:
             return
         if self._deploying and not initial:
             QMessageBox.warning(self, "正在部署", "部署完成后才能切换列表")
@@ -1223,7 +1678,19 @@ class ApplicationWindow(QMainWindow):
             return
         if not initial and (not self._confirm_pending_changes() or not self._conceal_current_parameter_password()):
             return
+        if self.view_mode == "task" and view_mode != "task":
+            self._active_execution_log = None
+            self._active_execution_task_path = None
+        if self.view_mode == "parameter" and view_mode != "parameter":
+            self._active_parameter_log = None
+            self._active_parameter_path = None
         self.view_mode = view_mode
+        self.file_list.setSelectionMode(
+            QAbstractItemView.ExtendedSelection
+            if view_mode == "log"
+            else QAbstractItemView.SingleSelection
+        )
+        self.select_all_logs_action.setEnabled(view_mode == "log")
         self.current_path = None
         self._set_editor_content("")
         for mode, button in self.nav_buttons.items():
@@ -1238,20 +1705,42 @@ class ApplicationWindow(QMainWindow):
     def update_file_list(self, select_path: Path | None = None) -> None:
         self._changing_selection = True
         self.file_list.clear()
-        extensions = {".txt"} if self.view_mode in {"task", "parameter"} else {".sh", ".bash", ".bat", ".cmd", ".ps1"}
-        files = [p for p in self.dir_path.iterdir() if p.is_file() and p.suffix.lower() in extensions]
+        extensions = (
+            {".txt"}
+            if self.view_mode in {"task", "parameter"}
+            else {".log"}
+            if self.view_mode == "log"
+            else {".sh", ".bash", ".bat", ".cmd", ".ps1"}
+        )
+        files = (
+            [p for p in self.dir_path.rglob("*.log") if p.is_file()]
+            if self.view_mode == "log"
+            else [
+                p for p in self.dir_path.iterdir()
+                if p.is_file() and p.suffix.lower() in extensions
+            ]
+        )
         order_by_name = {
             name: index
             for index, name in enumerate(self._file_orders().get(self.view_mode, []))
         }
-        files.sort(key=lambda path: (order_by_name.get(path.name, len(order_by_name)), path.name.lower()))
+        if self.view_mode == "log":
+            files.sort(key=lambda path: (path.parent.name, path.name.lower()), reverse=True)
+        else:
+            files.sort(key=lambda path: (order_by_name.get(path.name, len(order_by_name)), path.name.lower()))
         for path in files:
-            item = QListWidgetItem(path.stem)
+            item = QListWidgetItem(
+                self._execution_log_label(path) if self.view_mode == "log" else path.stem
+            )
             item.setData(Qt.UserRole, str(path.resolve()))
             self.file_list.addItem(item)
             if select_path is not None and path.resolve() == select_path.resolve():
                 self.file_list.setCurrentItem(item)
         self._changing_selection = False
+
+    @staticmethod
+    def _execution_log_label(path: Path) -> str:
+        return f"{path.parent.name}  {path.stem}"
 
     def _file_orders(self) -> dict[str, list[str]]:
         raw_orders = self.application_settings.get("file_orders", {})
@@ -1260,7 +1749,7 @@ class ApplicationWindow(QMainWindow):
         return {
             mode: [Path(str(name)).name for name in names if name]
             for mode, names in raw_orders.items()
-            if mode in {"task", "parameter", "script"} and isinstance(names, list)
+            if mode in {"task", "parameter", "script", "log"} and isinstance(names, list)
         }
 
     def _save_file_order(self, *_arguments: object) -> None:
@@ -1279,24 +1768,49 @@ class ApplicationWindow(QMainWindow):
 
     def _restore_current_view_file(self) -> None:
         name = self.last_selected_files.get(self.view_mode)
-        candidate = (self.dir_path / Path(name).name).resolve() if name else None
+        candidate = (
+            (self.dir_path / name).resolve()
+            if name and self.view_mode == "log"
+            else (self.dir_path / Path(name).name).resolve()
+            if name
+            else None
+        )
         selected = candidate if candidate is not None and candidate.is_file() else None
         self.update_file_list(selected)
         if selected is not None:
             self._load_file(selected)
+        elif self.view_mode == "log":
+            self._structured_workflow_steps = None
+            self._set_editor_content("")
+            self.editor.setReadOnly(True)
+            self._dirty = False
         else:
             self._restore_untitled_draft()
 
-    def _on_file_selected(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+    def _on_file_selected(self, current: QListWidgetItem | None, previous: QListWidgetItem | None) -> None:
         if self._changing_selection or current is None:
             return
         path = Path(str(current.data(Qt.UserRole))).resolve()
         if path == self.current_path:
             return
         if not self._confirm_pending_changes() or not self._conceal_current_parameter_password():
-            self.update_file_list(self.current_path)
+            QTimer.singleShot(
+                0,
+                lambda item=previous: self._restore_file_list_selection(item),
+            )
             return
         self._load_file(path)
+
+    def _restore_file_list_selection(self, item: QListWidgetItem | None) -> None:
+        blocker = QSignalBlocker(self.file_list)
+        self.file_list.clearSelection()
+        if item is not None:
+            item.setSelected(True)
+            self.file_list.setCurrentItem(item)
+            self.file_list.scrollToItem(item)
+        else:
+            self.file_list.setCurrentItem(None)
+        del blocker
 
     def _show_file_context_menu(self, position: QPoint) -> None:
         item = self.file_list.itemAt(position)
@@ -1310,12 +1824,70 @@ class ApplicationWindow(QMainWindow):
             "QMenu::item:selected { background:#dbeafe; color:#1d4ed8; }"
             "QMenu::item:disabled { color:#94a3b8; }"
         )
+        if self.view_mode == "log":
+            if not item.isSelected():
+                self.file_list.clearSelection()
+                item.setSelected(True)
+                self.file_list.setCurrentItem(item)
+            selected_paths = self._selected_execution_logs()
+            delete_action = menu.addAction(
+                f"删除选中的 {len(selected_paths)} 个日志"
+                if len(selected_paths) > 1
+                else "删除日志"
+            )
+            delete_action.triggered.connect(
+                lambda _checked=False, targets=tuple(selected_paths):
+                self._delete_execution_logs(targets)
+            )
+            menu.exec(self.file_list.viewport().mapToGlobal(position))
+            return
         history_action = menu.addAction("历史版本")
         history_action.setEnabled(any(self._history_directory(path).glob("*.txt")))
         history_action.triggered.connect(
             lambda _checked=False, target=path: self._show_file_history(target)
         )
         menu.exec(self.file_list.viewport().mapToGlobal(position))
+
+    def _selected_execution_logs(self) -> list[Path]:
+        return [
+            Path(str(item.data(Qt.UserRole))).resolve()
+            for item in self.file_list.selectedItems()
+        ]
+
+    def _delete_execution_logs(self, paths: tuple[Path, ...] | list[Path]) -> None:
+        paths = list(dict.fromkeys(path.resolve() for path in paths))
+        if not paths:
+            return
+        message = (
+            f"确定删除选中的 {len(paths)} 个日志吗？"
+            if len(paths) > 1
+            else f"确定删除日志“{self._execution_log_label(paths[0])}”吗？"
+        )
+        if QMessageBox.question(
+            self, "确认删除", message
+        ) != QMessageBox.Yes:
+            return
+        failed: list[str] = []
+        for path in paths:
+            try:
+                path.unlink()
+                if path.parent != self.execution_log_root:
+                    try:
+                        path.parent.rmdir()
+                    except OSError:
+                        pass
+            except OSError as exc:
+                failed.append(f"{path.name}：{exc}")
+        if self.current_path in paths:
+            self.current_path = None
+            self.last_selected_files.pop("log", None)
+            self._set_editor_content("")
+            self.editor.setReadOnly(True)
+        self.update_file_list()
+        if failed:
+            QMessageBox.critical(self, "部分日志删除失败", "\n".join(failed))
+        deleted_count = len(paths) - len(failed)
+        self.status_label.setText(f"已删除 {deleted_count} 个日志")
 
     def _show_file_history(self, path: Path) -> None:
         history_mode = self._history_mode(path)
@@ -1673,9 +2245,14 @@ class ApplicationWindow(QMainWindow):
             indent=2,
         ) + "\n"
 
-    def _structured_workflow_summary(self) -> str:
+    def _structured_workflow_summary(
+        self, selected_steps: list[int] | tuple[int, ...] | set[int] | None = None
+    ) -> str:
+        selected = set(selected_steps) if selected_steps is not None else None
         lines: list[str] = []
         for index, step in enumerate(self._structured_workflow_steps or [], start=1):
+            if selected is not None and index not in selected:
+                continue
             step_type = str(step.get("type", "")).upper()
             definition = WORKFLOW_TYPE_BY_KEY.get(step_type)
             lines.append(f"第 {index} 步：{definition.label if definition else step_type}")
@@ -1691,6 +2268,26 @@ class ApplicationWindow(QMainWindow):
 
     def _load_file(self, path: Path) -> bool:
         self.history_timer.stop()
+        if self.view_mode == "log":
+            try:
+                resolved_path = path.resolve()
+                content, sequence = self._parameter_log_writer.read_text(resolved_path)
+            except (OSError, UnicodeDecodeError) as exc:
+                QMessageBox.critical(self, "读取日志失败", str(exc))
+                return False
+            self.current_path = resolved_path
+            self._displayed_log_sequences[resolved_path] = sequence
+            self.last_selected_files[self.view_mode] = str(
+                path.resolve().relative_to(self.execution_log_root)
+            )
+            self._structured_workflow_steps = None
+            self._set_editor_content(content)
+            self.editor.setReadOnly(True)
+            self._dirty = False
+            self.editor.document().setModified(False)
+            self.status_label.setText(f"已加载日志 {self._execution_log_label(path)}")
+            self._update_controls()
+            return True
         try:
             stored = path.read_text(encoding="utf-8-sig")
             self._structured_workflow_steps = None
@@ -1733,6 +2330,10 @@ class ApplicationWindow(QMainWindow):
         self.editor.setReadOnly(self._structured_workflow_steps is not None)
         self._dirty = dirty
         self.editor.document().setModified(dirty)
+        if self.view_mode == "task":
+            self._ensure_task_execution_log(self.current_path)
+        elif self.view_mode == "parameter":
+            self._ensure_parameter_log(self.current_path)
         self.status_label.setText(f"已加载 {path.name}" + ("（存在暂存内容）" if dirty else ""))
         self._update_controls()
         return True
@@ -1754,6 +2355,14 @@ class ApplicationWindow(QMainWindow):
         if not preserve_view and hasattr(self, "workflow_panel"):
             self.workflow_panel.clear_selection()
         self._refresh_workflow_diagram(preserve_view=preserve_view)
+        if (
+            preserve_view
+            and self.view_mode == "task"
+            and self._structured_workflow_steps is not None
+        ):
+            selected_steps = self.workflow_panel.selected_steps()
+            if selected_steps:
+                self._set_structured_workflow_display(selected_steps)
 
     def _editor_changed(self) -> None:
         if self._loading_editor:
@@ -1805,6 +2414,10 @@ class ApplicationWindow(QMainWindow):
                 action = menu.addAction("从此位置开始执行")
                 action.triggered.connect(
                     lambda _checked=False, value=step_index: self.develop_method(value)
+                )
+                single_action = menu.addAction("单独执行此步骤")
+                single_action.triggered.connect(
+                    lambda _checked=False, value=step_index: self.develop_method(value, True)
                 )
         menu.exec(self.editor.mapToGlobal(position))
 
@@ -2084,6 +2697,9 @@ class ApplicationWindow(QMainWindow):
         self._load_file(target)
 
     def delete_file(self) -> None:
+        if self.view_mode == "log":
+            self._delete_execution_logs(self._selected_execution_logs())
+            return
         path = self._require_current_path()
         if path is None:
             return
@@ -2303,6 +2919,9 @@ class ApplicationWindow(QMainWindow):
     def _focus_workflow_step(self, step_index: int) -> None:
         if self.view_mode != "task":
             return
+        if self._structured_workflow_steps is not None:
+            self._set_structured_workflow_display([step_index])
+            return
         block = self.editor.document().firstBlock()
         pattern = re.compile(rf"\s*STEP_{step_index}_TYPE\s*=", re.IGNORECASE)
         while block.isValid():
@@ -2314,6 +2933,73 @@ class ApplicationWindow(QMainWindow):
                 self.editor.setFocus()
                 return
             block = block.next()
+
+    def _focus_workflow_steps(self, step_indexes: object) -> None:
+        steps = sorted({int(value) for value in step_indexes}) if isinstance(
+            step_indexes, (list, tuple, set)
+        ) else []
+        if not steps:
+            self._show_all_workflow_steps()
+        elif self._structured_workflow_steps is not None:
+            self._set_structured_workflow_display(steps)
+        elif len(steps) == 1:
+            self._focus_workflow_step(steps[0])
+
+    def _show_all_workflow_steps(self) -> None:
+        if self.view_mode == "task" and self._structured_workflow_steps is not None:
+            self._set_structured_workflow_display()
+
+    def _move_workflow_step(self, source_step: int, target_step: int) -> None:
+        if self.view_mode != "task" or self._deploying:
+            return
+        steps = self._workflow_steps_from_editor()
+        indexes = [index for index, _step_type in steps]
+        if source_step not in indexes or target_step not in indexes:
+            return
+        reordered_indexes = list(indexes)
+        reordered_indexes.remove(source_step)
+        reordered_indexes.insert(
+            reordered_indexes.index(target_step) + 1,
+            source_step,
+        )
+        if reordered_indexes == indexes:
+            return
+        new_indexes = {
+            old_index: new_index
+            for new_index, old_index in enumerate(reordered_indexes, start=1)
+        }
+        moved_step_index = new_indexes[source_step]
+        if self._structured_workflow_steps is not None:
+            source_object = self._structured_workflow_steps[source_step - 1]
+            target_object = self._structured_workflow_steps[target_step - 1]
+            self._structured_workflow_steps.remove(source_object)
+            self._structured_workflow_steps.insert(
+                self._structured_workflow_steps.index(target_object) + 1,
+                source_object,
+            )
+            content = self._structured_workflow_summary()
+        else:
+            content = re.sub(
+                r"(?mi)^(\s*)STEP_(\d+)_",
+                lambda match: (
+                    f"{match.group(1)}STEP_"
+                    f"{new_indexes.get(int(match.group(2)), int(match.group(2)))}_"
+                ),
+                self.editor.toPlainText(),
+            )
+        self._set_editor_content(content, preserve_view=True)
+        self._mark_changed(
+            f"已将原第 {source_step} 步移动到第 {moved_step_index} 步"
+        )
+        self.workflow_panel.set_selected_steps([moved_step_index])
+
+    def _set_structured_workflow_display(
+        self, step_indexes: list[int] | tuple[int, ...] | set[int] | None = None
+    ) -> None:
+        self._loading_editor = True
+        self.editor.setPlainText(self._structured_workflow_summary(step_indexes))
+        self.editor.document().setModified(self._dirty)
+        self._loading_editor = False
 
     def _workflow_step_values(self, step_index: int) -> dict[str, str]:
         if self._structured_workflow_steps is not None:
@@ -2341,16 +3027,28 @@ class ApplicationWindow(QMainWindow):
         if self.view_mode != "task" or self._deploying:
             return
         menu = QMenu(self)
-        action = menu.addAction("从此位置开始执行")
-        action.triggered.connect(
-            lambda _checked=False, value=step_index: self.develop_method(value)
-        )
+        selected_steps = self.workflow_panel.selected_steps()
+        if len(selected_steps) > 1:
+            selected_action = menu.addAction(f"执行选中的 {len(selected_steps)} 个步骤")
+            selected_action.triggered.connect(
+                lambda _checked=False, values=tuple(selected_steps):
+                self.develop_method(selected_steps=values)
+            )
+        else:
+            action = menu.addAction("从此位置开始执行")
+            action.triggered.connect(
+                lambda _checked=False, value=step_index: self.develop_method(value)
+            )
+            single_action = menu.addAction("单独执行此步骤")
+            single_action.triggered.connect(
+                lambda _checked=False, value=step_index: self.develop_method(value, True)
+            )
         menu.exec(position)
 
     def _sync_editor_display(self, _checked: bool = False) -> None:
         task_view = self.view_mode == "task"
         parameter_view = self.view_mode == "parameter"
-        show_editor = self.view_mode == "script" or (
+        show_editor = self.view_mode in {"script", "log"} or (
             task_view and self.parameter_view_button.isChecked()
         )
         show_flow = task_view and self.flow_view_button.isChecked()
@@ -2573,7 +3271,21 @@ class ApplicationWindow(QMainWindow):
             self.history_timer.start()
         self.status_label.setText(status + "，点击保存后生效")
 
-    def develop_method(self, start_step: int | None = None) -> None:
+    def _execute_selected_or_all(self) -> None:
+        if self._deploying:
+            self.develop_method()
+            return
+        selected_steps = tuple(self.workflow_panel.selected_steps())
+        self.develop_method(selected_steps=selected_steps or None)
+
+    def develop_method(
+        self,
+        start_step: int | None = None,
+        single_step: bool = False,
+        selected_steps: tuple[int, ...] | None = None,
+    ) -> None:
+        if isinstance(start_step, bool):
+            start_step = None
         if self._deploying:
             self._request_stop_execution()
             return
@@ -2594,8 +3306,36 @@ class ApplicationWindow(QMainWindow):
             QMessageBox.critical(self, "任务配置错误", str(exc))
             return
         if workflow_task is not None:
+            if selected_steps:
+                selected_indexes = tuple(sorted(set(selected_steps)))
+                available_indexes = {step.index for step in workflow_task.steps}
+                missing_indexes = [
+                    index for index in selected_indexes if index not in available_indexes
+                ]
+                if missing_indexes:
+                    QMessageBox.warning(
+                        self,
+                        "无法执行",
+                        "任务中不存在步骤：" + "、".join(map(str, missing_indexes)),
+                    )
+                    return
+                steps = tuple(
+                    step for step in workflow_task.steps if step.index in selected_indexes
+                )
+                workflow_task = WorkflowTask(
+                    workflow_task.name,
+                    workflow_task.file_path,
+                    steps,
+                )
+                self._start_workflow(
+                    workflow_task, selected_steps=selected_indexes
+                )
+                return
             if start_step is not None:
-                steps = tuple(step for step in workflow_task.steps if step.index >= start_step)
+                steps = tuple(
+                    step for step in workflow_task.steps
+                    if step.index == start_step or (not single_step and step.index >= start_step)
+                )
                 if not steps or steps[0].index != start_step:
                     QMessageBox.warning(self, "无法执行", f"任务中不存在第 {start_step} 步")
                     return
@@ -2604,7 +3344,7 @@ class ApplicationWindow(QMainWindow):
                     workflow_task.file_path,
                     steps,
                 )
-                self._start_workflow(workflow_task, start_step)
+                self._start_workflow(workflow_task, start_step, single_step)
                 return
             else:
                 confirmation = f"任务：{workflow_task.name}\n共 {len(workflow_task.steps)} 个步骤\n\n确定执行吗？"
@@ -2640,14 +3380,33 @@ class ApplicationWindow(QMainWindow):
         self.interaction_tabs.setCurrentIndex(0)
         self.log_text.clear()
         self.progress_bar.setValue(0)
+        if self.current_path is not None:
+            self._ensure_task_execution_log(self.current_path)
+        self._append_log(
+            f"========== 执行时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} =========="
+        )
         self._append_log(title)
         self._deploying = True
         self._stop_requested = False
         self._execution_cancel_event.clear()
         self._update_controls()
 
-    def _start_workflow(self, task: WorkflowTask, start_step: int | None = None) -> None:
-        start_message = "从此位置开始执行\n" if start_step is not None else ""
+    def _start_workflow(
+        self,
+        task: WorkflowTask,
+        start_step: int | None = None,
+        single_step: bool = False,
+        selected_steps: tuple[int, ...] | None = None,
+    ) -> None:
+        start_message = (
+            "执行选中的步骤：" + "、".join(map(str, selected_steps)) + "\n"
+            if selected_steps
+            else f"单独执行第 {start_step} 步\n"
+            if single_step and start_step is not None
+            else "从此位置开始执行\n"
+            if start_step is not None
+            else ""
+        )
         self._prepare_execution(f"执行任务：{task.name}\n{start_message}共 {len(task.steps)} 个步骤，将按配置顺序执行")
         self.status_label.setText("正在执行……")
         threading.Thread(target=self._workflow_worker, args=(task,), name="workflow-worker", daemon=True).start()
@@ -2719,7 +3478,11 @@ class ApplicationWindow(QMainWindow):
         if kind == "workflow_success":
             self.progress_bar.setValue(100)
             self._append_log("任务执行完成")
-            QMessageBox.information(self, "执行完成", f"任务“{payload}”已执行完成")
+            self._show_topmost_message(
+                QMessageBox.Information,
+                "执行完成",
+                f"任务“{payload}”已执行完成",
+            )
         elif kind == "workflow_error":
             self._append_log(f"执行失败：{payload}")
             QMessageBox.critical(self, "执行失败", str(payload))
@@ -2741,12 +3504,114 @@ class ApplicationWindow(QMainWindow):
             QMessageBox.critical(self, "部署失败", str(payload))
         self._sync_interaction_panel_visibility()
 
+    def _ensure_task_execution_log(self, task_path: Path) -> None:
+        task_path = task_path.resolve()
+        if (
+            self._active_execution_task_path == task_path
+            and self._active_execution_log is not None
+            and self._active_execution_log.is_file()
+        ):
+            return
+        self._execution_log_write_failed = False
+        created_at = datetime.now()
+        date_dir = self.execution_log_root / created_at.strftime("%Y-%m-%d")
+        time_value = created_at.strftime("%H-%M-%S-%f")
+        path = date_dir / f"{task_path.stem}_{time_value}.log"
+        try:
+            date_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"打开任务：{task_path.stem}\n"
+                f"打开时间：{created_at.strftime('%Y-%m-%d %H:%M:%S')}\n",
+                encoding="utf-8",
+            )
+        except OSError:
+            self._active_execution_log = None
+            self._active_execution_task_path = None
+            self._execution_log_write_failed = True
+            return
+        self._active_execution_log = path
+        self._active_execution_task_path = task_path
+
+    def _ensure_parameter_log(self, parameter_path: Path) -> Path | None:
+        parameter_path = parameter_path.resolve()
+        if (
+            self._active_parameter_path == parameter_path
+            and self._active_parameter_log is not None
+            and self._active_parameter_log.is_file()
+        ):
+            return self._active_parameter_log
+        created_at = datetime.now()
+        date_dir = self.execution_log_root / created_at.strftime("%Y-%m-%d")
+        time_value = created_at.strftime("%H-%M-%S-%f")
+        path = date_dir / f"{parameter_path.stem}_{time_value}.log"
+        try:
+            date_dir.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                f"打开配置：{parameter_path.stem}\n"
+                f"打开时间：{created_at.strftime('%Y-%m-%d %H:%M:%S')}\n",
+                encoding="utf-8",
+            )
+        except OSError as exc:
+            self._active_parameter_log = None
+            self._active_parameter_path = None
+            self.status_label.setText(f"配置日志保存失败：{exc}")
+            return None
+        self._active_parameter_log = path
+        self._active_parameter_path = parameter_path
+        return path
+
+    def _append_parameter_log(
+        self, log_path: Path | None, event_type: str, value: str
+    ) -> None:
+        if log_path is None or not value:
+            return
+        self._parameter_log_writer.append(log_path, event_type, value)
+
+    def _parameter_log_appended(
+        self, log_path: Path, text: str, sequence: int
+    ) -> None:
+        if self.view_mode == "log" and self.current_path == log_path:
+            if sequence <= self._displayed_log_sequences.get(log_path, 0):
+                return
+            cursor = self.editor.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            cursor.insertText(text)
+            self.editor.setTextCursor(cursor)
+            self.editor.ensureCursorVisible()
+            self._displayed_log_sequences[log_path] = sequence
+
+    def _parameter_log_failed(self, error: str) -> None:
+        self.status_label.setText(f"配置日志保存失败：{error}")
+
+    def _show_topmost_message(
+        self, icon: QMessageBox.Icon, title: str, message: str
+    ) -> None:
+        QApplication.alert(self, 0)
+        dialog = QMessageBox(icon, title, message, QMessageBox.Ok, None)
+        dialog.setWindowModality(Qt.ApplicationModal)
+        dialog.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+        QTimer.singleShot(
+            0,
+            lambda target=dialog: (target.raise_(), target.activateWindow()),
+        )
+        dialog.exec()
+
     def _append_log(self, value: str) -> None:
+        line = value.rstrip() + "\n"
         cursor = self.log_text.textCursor()
         cursor.movePosition(QTextCursor.End)
-        cursor.insertText(value.rstrip() + "\n")
+        cursor.insertText(line)
         self.log_text.setTextCursor(cursor)
         self.log_text.ensureCursorVisible()
+        if self._active_execution_log is not None:
+            try:
+                with self._active_execution_log.open("a", encoding="utf-8") as stream:
+                    stream.write(line)
+            except OSError as exc:
+                self._active_execution_log = None
+                if not self._execution_log_write_failed:
+                    self._execution_log_write_failed = True
+                    self.status_label.setText(f"执行日志保存失败：{exc}")
 
     def _toggle_ssh_connection(self) -> None:
         self._open_ssh_connection()
@@ -2761,14 +3626,23 @@ class ApplicationWindow(QMainWindow):
         self,
         direct_path: str | None = None,
         direct_command: str | None = None,
+        *,
+        parameter_path: Path | None = None,
     ) -> None:
-        if self.view_mode != "parameter" or self.current_path is None:
-            QMessageBox.warning(self, "无法连接", "请在“配置”页面选择服务器配置文件")
-            return
-        if self._dirty and not self.save_text(show_message=False):
+        if parameter_path is None:
+            if self.view_mode != "parameter" or self.current_path is None:
+                QMessageBox.warning(self, "无法连接", "请在“配置”页面选择服务器配置文件")
+                return
+            parameter_path = self.current_path
+        parameter_path = parameter_path.resolve()
+        editing_target = (
+            self.view_mode == "parameter" and self.current_path is not None
+            and self.current_path.resolve() == parameter_path
+        )
+        if editing_target and self._dirty and not self.save_text(show_message=False):
             return
         try:
-            parameters = load_server_parameters(self.current_path)
+            parameters = load_server_parameters(parameter_path)
         except ConfigurationError as exc:
             QMessageBox.critical(self, "服务器配置错误", str(exc))
             return
@@ -2787,10 +3661,26 @@ class ApplicationWindow(QMainWindow):
                 )
                 if command_enabled and selected_index < len(parameters.default_open_commands):
                     default_command = parameters.default_open_commands[selected_index]
-        parameter_path = self.current_path.resolve()
+        parameter_log = self._ensure_parameter_log(parameter_path)
+        self._append_parameter_log(
+            parameter_log, "连接服务器", parameters.target
+        )
+        if default_path:
+            self._append_parameter_log(parameter_log, "进入目录", default_path)
+        if default_command:
+            self._append_parameter_log(parameter_log, "自动执行命令", default_command)
         tab = QtSSHTerminalTab(
             self.interaction_tabs, parameters, parameter_path, default_path, default_command,
             self._on_ssh_state_changed, self._close_ssh_tab,
+            lambda event_type, value, target=parameter_log:
+            self._append_parameter_log(target, event_type, value),
+            lambda target=parameter_log: (
+                self._parameter_log_writer.read_text(target)[0]
+                if target is not None and target.is_file() else ""
+            ),
+            self._toggle_ssh_tool_mode,
+            self.ssh_monitor_panel_width,
+            self._save_ssh_monitor_panel_width,
         )
         tabs = self.ssh_tabs.setdefault(parameter_path, [])
         tabs.append(tab)
@@ -2799,10 +3689,69 @@ class ApplicationWindow(QMainWindow):
         name = parameters.name if sequence == 1 else f"{parameters.name} ({sequence})"
         self._ssh_tab_names[tab] = name
         index = self.interaction_tabs.addTab(tab, name)
+        self._refresh_ssh_tab_buttons()
         self._show_interaction_panel(force=True)
         self.interaction_tabs.setCurrentIndex(index)
         tab.start_connection()
         self.status_label.setText(f"正在连接 {parameters.target}……")
+
+    def _refresh_ssh_tab_buttons(self) -> None:
+        bar = self.interaction_tabs.tabBar()
+        for index in range(self.interaction_tabs.count()):
+            old = bar.tabButton(index, QTabBar.RightSide)
+            bar.setTabButton(index, QTabBar.RightSide, None)
+            if old is not None:
+                old.deleteLater()
+            widget = self.interaction_tabs.widget(index)
+            buttons = QWidget(bar)
+            layout = QHBoxLayout(buttons)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(2)
+            if isinstance(widget, QtSSHTerminalTab):
+                close_button = QPushButton("×")
+                close_button.setFlat(True)
+                close_button.setFixedSize(22, 22)
+                close_button.setToolTip("关闭此连接")
+                close_button.clicked.connect(lambda _checked=False, tab=widget: self._close_ssh_tab(tab))
+                layout.addWidget(close_button)
+            if index == self.interaction_tabs.count() - 1:
+                add_button = QPushButton("＋")
+                add_button.setFlat(True)
+                add_button.setFixedSize(24, 22)
+                add_button.setToolTip("选择服务器，打开新连接")
+                add_button.clicked.connect(self._choose_ssh_server)
+                layout.addWidget(add_button)
+            buttons.adjustSize()
+            bar.setTabButton(index, QTabBar.RightSide, buttons)
+
+    def _choose_ssh_server(self) -> None:
+        paths = sorted(self.parameter_dir.glob("*.txt"), key=lambda path: path.name.casefold())
+        if not paths:
+            QMessageBox.information(self, "暂无服务器", "请先在配置页面新建服务器配置。")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择服务器")
+        dialog.resize(420, 360)
+        layout = QVBoxLayout(dialog)
+        servers = QListWidget()
+        for path in paths:
+            item = QListWidgetItem(path.stem)
+            item.setData(Qt.UserRole, path)
+            servers.addItem(item)
+        servers.setCurrentRow(0)
+        layout.addWidget(servers, 1)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        connect_button = QPushButton("连接")
+        connect_button.clicked.connect(dialog.accept)
+        row.addWidget(connect_button)
+        cancel_button = QPushButton("取消")
+        cancel_button.clicked.connect(dialog.reject)
+        row.addWidget(cancel_button)
+        layout.addLayout(row)
+        servers.itemDoubleClicked.connect(lambda _item: dialog.accept())
+        if dialog.exec() == QDialog.Accepted and servers.currentItem() is not None:
+            self._open_ssh_connection(parameter_path=servers.currentItem().data(Qt.UserRole))
 
     def _on_ssh_state_changed(self, tab: QtSSHTerminalTab) -> None:
         index = self.interaction_tabs.indexOf(tab)
@@ -2822,6 +3771,8 @@ class ApplicationWindow(QMainWindow):
             self._close_ssh_tab(widget)
 
     def _close_ssh_tab(self, tab: QtSSHTerminalTab) -> None:
+        if not tab.close_file_editors():
+            return
         tabs = self.ssh_tabs.get(tab.parameter_path, [])
         if tab in tabs:
             tabs.remove(tab)
@@ -2831,6 +3782,7 @@ class ApplicationWindow(QMainWindow):
         index = self.interaction_tabs.indexOf(tab)
         if index >= 0:
             self.interaction_tabs.removeTab(index)
+        self._refresh_ssh_tab_buttons()
         tab.shutdown()
         tab.deleteLater()
         self._sync_interaction_panel_visibility()
@@ -2847,18 +3799,112 @@ class ApplicationWindow(QMainWindow):
             self._show_interaction_panel(force=True)
         self._update_controls()
 
+    def _save_ssh_monitor_panel_width(self, width: int) -> None:
+        width = min(400, max(220, int(width)))
+        if width == self.ssh_monitor_panel_width:
+            return
+        self.ssh_monitor_panel_width = width
+        settings = dict(self.application_settings)
+        settings["ssh_monitor_panel_width"] = width
+        self._write_settings(settings)
+
+    def _layout_dimension_changed(self, _position: int, _index: int) -> None:
+        if not self._ssh_tool_mode:
+            self.layout_save_timer.start()
+
+    def _save_layout_dimensions(self) -> None:
+        if self._ssh_tool_mode:
+            return
+        main_sizes = self.main_splitter.sizes()
+        right_sizes = self.right_splitter.sizes()
+        if len(main_sizes) == 2 and self.sidebar.isVisible():
+            self.file_sidebar_width = min(700, max(190, int(main_sizes[0])))
+        if (
+            len(right_sizes) == 2
+            and self.interaction_tabs.isVisible()
+            and right_sizes[1] > 0
+        ):
+            self.ssh_console_height = min(900, max(160, int(right_sizes[1])))
+        settings = dict(self.application_settings)
+        settings["file_sidebar_width"] = self.file_sidebar_width
+        settings["ssh_console_height"] = self.ssh_console_height
+        self._write_settings(settings)
+
+    def _toggle_ssh_tool_mode(self) -> None:
+        self._set_ssh_tool_mode(not self._ssh_tool_mode)
+
+    def _set_ssh_tool_mode(self, enabled: bool) -> None:
+        ssh_tabs = [
+            tab
+            for tabs in self.ssh_tabs.values()
+            for tab in tabs
+            if self.interaction_tabs.indexOf(tab) >= 0
+        ]
+        if enabled and not ssh_tabs:
+            QMessageBox.information(self, "SSH 工具", "请先连接一台服务器")
+            return
+        if enabled == self._ssh_tool_mode:
+            return
+        if enabled:
+            self._ssh_tool_restore_main_sizes = self.main_splitter.sizes()
+            self._ssh_tool_restore_right_sizes = self.right_splitter.sizes()
+            self._ssh_tool_restore_interaction_visible = self.interaction_tabs.isVisible()
+            self._ssh_tool_mode = True
+            self.sidebar.setVisible(False)
+            self.editor_container.setVisible(False)
+            self.interaction_tabs.setVisible(True)
+            self.main_splitter.setSizes([0, max(1, self.main_splitter.width())])
+            self.right_splitter.setSizes([0, max(1, self.right_splitter.height())])
+            current = self.interaction_tabs.currentWidget()
+            if not isinstance(current, QtSSHTerminalTab):
+                target = next((tab for tab in ssh_tabs if tab.connected), ssh_tabs[-1])
+                self.interaction_tabs.setCurrentWidget(target)
+                current = target
+            if isinstance(current, QtSSHTerminalTab):
+                current.focus_terminal()
+        else:
+            self._ssh_tool_mode = False
+            self.sidebar.setVisible(True)
+            self.editor_container.setVisible(True)
+            if self._ssh_tool_restore_main_sizes:
+                self.main_splitter.setSizes(self._ssh_tool_restore_main_sizes)
+            if self._ssh_tool_restore_right_sizes:
+                self.right_splitter.setSizes(self._ssh_tool_restore_right_sizes)
+            self.interaction_tabs.setVisible(
+                self._ssh_tool_restore_interaction_visible
+            )
+        self._update_controls()
+
     def _show_interaction_panel(self, force: bool = False) -> None:
         if self._interaction_panel_user_hidden and not force:
             return
         self.interaction_tabs.setVisible(True)
         if force:
             self._interaction_panel_user_hidden = False
+        if self._ssh_tool_mode:
+            self.right_splitter.setSizes([0, max(1, self.right_splitter.height())])
+            self._update_controls()
+            return
         sizes = self.right_splitter.sizes()
-        if len(sizes) == 2 and sizes[1] < 100:
-            self.right_splitter.setSizes([max(300, sizes[0] - 180), 180])
+        if len(sizes) == 2 and sizes[1] < self.ssh_console_height:
+            height_delta = self.ssh_console_height - sizes[1]
+            self.right_splitter.setSizes(
+                [max(300, sizes[0] - height_delta), self.ssh_console_height]
+            )
         self._update_controls()
 
     def _sync_interaction_panel_visibility(self) -> None:
+        if self._ssh_tool_mode:
+            if any(self.ssh_tabs.values()):
+                self.interaction_tabs.setVisible(True)
+                self.right_splitter.setSizes(
+                    [0, max(1, self.right_splitter.height())]
+                )
+                self._update_controls()
+            else:
+                self._ssh_tool_restore_interaction_visible = False
+                self._set_ssh_tool_mode(False)
+            return
         active = self._deploying or any(tab.state in {"connecting", "connected"} for tabs in self.ssh_tabs.values() for tab in tabs)
         if active:
             self._show_interaction_panel()
@@ -2867,27 +3913,43 @@ class ApplicationWindow(QMainWindow):
         self._update_controls()
 
     def _update_controls(self) -> None:
-        for button in self.file_buttons:
-            button.setEnabled(not self._deploying)
+        for index, button in enumerate(self.file_buttons):
+            button.setEnabled(
+                not self._deploying and (self.view_mode != "log" or index == 3)
+            )
+            button.setVisible(not self._ssh_tool_mode)
         for button in self.nav_buttons.values():
             button.setEnabled(not self._deploying)
-        self.password_button.setVisible(self.view_mode == "parameter")
+        self.password_button.setVisible(
+            not self._ssh_tool_mode and self.view_mode == "parameter"
+        )
         if self._password_hiding_enabled():
             self.password_button.setText("隐藏密码" if self._parameter_password_visible else "显示密码")
         else:
             self.password_button.setText("开启隐藏密码")
         self.password_button.setEnabled(not self._deploying and (not self._password_hiding_enabled() or self.current_path is not None))
+        self.connect_button.setVisible(not self._ssh_tool_mode)
         self.connect_button.setEnabled(not self._deploying and self.view_mode == "parameter" and self.current_path is not None)
         self.add_step_button.setVisible(self.view_mode == "task")
-        self.history_button.setVisible(True)
-        self.history_button.setEnabled(not self._deploying and self.current_path is not None)
+        self.history_button.setVisible(self.view_mode != "log")
+        self.history_button.setEnabled(
+            not self._deploying and self.current_path is not None
+        )
         for button in (self.parameter_view_button, self.flow_view_button):
             button.setVisible(self.view_mode == "task")
             button.setEnabled(not self._deploying)
         self._sync_editor_display()
         self.execute_button.setText("停止" if self._deploying else "执行")
         self.execute_button.setEnabled((not self._deploying and self.view_mode == "task") or (self._deploying and not self._stop_requested))
+        self.execute_button.setVisible(not self._ssh_tool_mode)
+        self.interaction_button.setVisible(not self._ssh_tool_mode)
         self.interaction_button.setText("隐藏交互窗口" if self.interaction_tabs.isVisible() else "显示交互窗口")
+        for tabs in self.ssh_tabs.values():
+            for tab in tabs:
+                tab.set_tool_mode(
+                    self._ssh_tool_mode,
+                    self._ssh_tool_mode or not self._deploying,
+                )
 
     def _read_settings(self) -> dict[str, object]:
         if not self.settings_path.is_file():
@@ -2939,7 +4001,13 @@ class ApplicationWindow(QMainWindow):
         general = QWidget()
         general_form = QFormLayout(general)
         startup = QComboBox()
-        startup_values = {"恢复上次页面": "last", "任务页面": "task", "配置页面": "parameter", "脚本页面": "script"}
+        startup_values = {
+            "恢复上次页面": "last",
+            "任务页面": "task",
+            "配置页面": "parameter",
+            "脚本页面": "script",
+            "日志页面": "log",
+        }
         startup.addItems(startup_values)
         current_startup = str(self.application_settings.get("startup_page", "last"))
         startup.setCurrentText(next((label for label, value in startup_values.items() if value == current_startup), "恢复上次页面"))
@@ -3308,12 +4376,8 @@ class ApplicationWindow(QMainWindow):
                 self.restoreState(bytes.fromhex(state))
             except ValueError:
                 pass
-        sizes = self.application_settings.get("qt_splitter_sizes")
-        if isinstance(sizes, list) and len(sizes) == 2:
-            try:
-                self.right_splitter.setSizes([int(sizes[0]), int(sizes[1])])
-            except (TypeError, ValueError):
-                pass
+        self.main_splitter.setSizes([self.file_sidebar_width, 1000])
+        self.right_splitter.setSizes([1000, self.ssh_console_height])
         if self.application_settings.get("window_state") == "zoomed":
             QTimer.singleShot(0, self.showMaximized)
 
@@ -3323,16 +4387,41 @@ class ApplicationWindow(QMainWindow):
             "editor_font_size": self.editor_font_size,
             "workflow_zoom": self.workflow_zoom,
             "workflow_task_zooms": dict(self.workflow_task_zooms),
+            "ssh_monitor_panel_width": self.ssh_monitor_panel_width,
+            "ssh_console_height": self.ssh_console_height,
+            "file_sidebar_width": self.file_sidebar_width,
             "view_mode": self.view_mode,
             "selected_files": dict(self.last_selected_files),
             "window_state": "zoomed" if self.isMaximized() else "normal",
             "qt_window_geometry": bytes(self.saveGeometry()).hex(),
             "qt_window_state": bytes(self.saveState()).hex(),
-            "qt_splitter_sizes": self.right_splitter.sizes(),
+            "qt_splitter_sizes": (
+                self._ssh_tool_restore_right_sizes
+                if self._ssh_tool_mode and self._ssh_tool_restore_right_sizes
+                else self.right_splitter.sizes()
+            ),
         })
         self._write_settings(settings)
 
+    def _poll_log_shutdown(self) -> None:
+        if self._parameter_log_writer.is_finished():
+            self._log_shutdown_timer.stop()
+            self.close()
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closing_for_logs:
+            if not self._parameter_log_writer.is_finished():
+                event.ignore()
+                return
+            self._log_shutdown_timer.stop()
+            self.setEnabled(True)
+            if self._parameter_log_writer.write_error:
+                QMessageBox.warning(
+                    self, "配置日志保存失败",
+                    "部分日志未能写入磁盘：\n" + self._parameter_log_writer.write_error,
+                )
+            event.accept()
+            return
         if self._deploying:
             QMessageBox.warning(self, "正在部署", "为避免在上传、替换或重启过程中中断操作，请等待本次部署完成后再关闭。")
             event.ignore()
@@ -3342,9 +4431,23 @@ class ApplicationWindow(QMainWindow):
             return
         for tabs in list(self.ssh_tabs.values()):
             for tab in list(tabs):
+                if not tab.close_file_editors():
+                    event.ignore()
+                    return
+        for tabs in list(self.ssh_tabs.values()):
+            for tab in list(tabs):
                 tab.shutdown()
+        self._parameter_log_writer.shutdown()
+        self.layout_save_timer.stop()
+        self._save_layout_dimensions()
         self._save_application_state()
-        event.accept()
+        self._closing_for_logs = True
+        self.auto_save_timer.stop()
+        self.history_timer.stop()
+        self.status_label.setText("正在保存剩余日志，完成后自动退出…")
+        self.setEnabled(False)
+        self._log_shutdown_timer.start()
+        event.ignore()
 
 
 def _application_root() -> Path:

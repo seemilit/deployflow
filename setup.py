@@ -24,6 +24,7 @@ setup(
         "paramiko>=3.4,<5",
         "pyte>=0.8.2,<1",
         "PySide6>=6.8,<7",
+        "PySide6-Addons>=6.8,<7",
     ],
     options={
         "build_exe": {
@@ -42,12 +43,17 @@ setup(
                 "password_protection",
                 "ssh_terminal",
                 "qt_ssh_terminal_view",
+                "qt_xterm_terminal",
+                "PySide6.QtWebChannel",
+                "PySide6.QtWebEngineCore",
+                "PySide6.QtWebEngineWidgets",
                 "workflow",
                 "workflow_executor",
             ],
             "include_files": [
                 ("templates", "templates"),
                 ("assets/app_icon.ico", "assets/app_icon.ico"),
+                ("app/resources/xterm", "resources/xterm"),
                 ("conf/tasks/.gitkeep", "conf/tasks/.gitkeep"),
                 ("conf/parameters/.gitkeep", "conf/parameters/.gitkeep"),
                 ("conf/scripts/.gitkeep", "conf/scripts/.gitkeep"),
