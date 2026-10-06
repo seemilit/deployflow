@@ -1,0 +1,96 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      CI: "true"
+
+    steps:
+      - name: Checkout repository and submodules
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12.8"
+          architecture: x64
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Create build environment and install dependencies
+        shell: cmd
+        run: |
+          python -m venv .venv
+          if errorlevel 1 exit /b 1
+          .venv\Scripts\python.exe -m pip install -r requirements.txt
+          if errorlevel 1 exit /b 1
+
+      - name: Prepare empty configuration folders
+        shell: pwsh
+        run: |
+          # conf is ignored by Git, but setup.py includes these placeholders.
+          foreach ($folder in @('tasks', 'host', 'scripts')) {
+            $directory = Join-Path 'conf' $folder
+            New-Item -ItemType Directory -Path $directory -Force | Out-Null
+            New-Item -ItemType File -Path (Join-Path $directory '.gitkeep') -Force | Out-Null
+          }
+
+      - name: Build portable application
+        shell: cmd
+        run: call build.bat
+
+      - name: Verify portable output
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath 'release/DeployFlow/DeployFlow.exe' -PathType Leaf)) {
+            throw 'build.bat did not generate release/DeployFlow/DeployFlow.exe.'
+          }
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.7.1 --yes --no-progress
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup installation failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Build Windows installer
+        shell: pwsh
+        run: |
+          $compiler = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+            throw "Inno Setup compiler was not found: $compiler"
+          }
+          & .\build_installer.bat $compiler
+          if ($LASTEXITCODE -ne 0) {
+            throw "build_installer.bat failed with exit code $LASTEXITCODE."
+          }
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v7
+        with:
+          name: DeployFlow-Windows-x64-Installer
+          path: installer-output/*-Setup.exe
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload portable application
+        uses: actions/upload-artifact@v7
+        with:
+          name: DeployFlow-Windows-x64-Portable
+          path: release/DeployFlow/
+          include-hidden-files: true
+          if-no-files-found: error

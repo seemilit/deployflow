@@ -1,5 +1,6 @@
 @echo off
 setlocal
+set "BUILD_EXIT_CODE=0"
 pushd "%~dp0"
 
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
@@ -97,10 +98,11 @@ echo %INSTALLER_FILE%
 goto :finish
 
 :failed
+set "BUILD_EXIT_CODE=1"
 echo.
 echo Installer build stopped.
 
 :finish
 popd
-pause
-endlocal
+if /I not "%CI%"=="true" pause
+endlocal & exit /b %BUILD_EXIT_CODE%

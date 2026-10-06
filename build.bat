@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
 setlocal
+set "BUILD_EXIT_CODE=0"
 pushd "%~dp0"
 
 set "PYTHON_EXE=%~dp0.venv\Scripts\python.exe"
@@ -63,10 +64,11 @@ echo [成功] 打包完成：%PACKAGE_DIR%\DeployFlow.exe
 goto :finish
 
 :failed
+set "BUILD_EXIT_CODE=1"
 echo.
 echo 打包已停止。
 
 :finish
 popd
-pause
-endlocal
+if /I not "%CI%"=="true" pause
+endlocal & exit /b %BUILD_EXIT_CODE%
