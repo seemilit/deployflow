@@ -6,9 +6,12 @@ import base64
 import codecs
 import hashlib
 import os
+import posixpath
 import queue
 import shlex
 import socket
+import stat
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -107,7 +110,11 @@ class InteractiveSSHSession:
         self._known_hosts_path = (
             known_hosts_path.expanduser().resolve()
             if known_hosts_path is not None
-            else (Path.home() / ".ssh" / "known_hosts").resolve()
+            else (
+                (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+                 else Path(__file__).resolve().parent.parent)
+                / "conf" / "known_hosts"
+            )
         )
         self._client: Any | None = None
         self._channel: Any | None = None
@@ -133,6 +140,10 @@ class InteractiveSSHSession:
         self._directory_retry_after = 0.0
         self._directory_sftp: Any | None = None
         self._directory_sftp_lock = threading.Lock()
+
+    @property
+    def local_data_directory(self) -> Path:
+        return self._known_hosts_path.parent
 
     @property
     def connected(self) -> bool:
@@ -205,7 +216,6 @@ class InteractiveSSHSession:
         self.close(notify=False)
         client = paramiko.SSHClient()
         try:
-            client.load_system_host_keys()
             if self._known_hosts_path.is_file():
                 client.load_host_keys(str(self._known_hosts_path))
         except (OSError, ValueError) as exc:
@@ -232,8 +242,8 @@ class InteractiveSSHSession:
             "timeout": 20,
             "auth_timeout": 20,
             "banner_timeout": 20,
-            "allow_agent": True,
-            "look_for_keys": True,
+            "allow_agent": False,
+            "look_for_keys": False,
         }
         if parameters.auth_method == "PASSWORD":
             connect_arguments["allow_agent"] = False
@@ -261,6 +271,10 @@ class InteractiveSSHSession:
                 )
             if cancelled:
                 raise SSHSessionError("SSH 连接已取消")
+            if initial_directory:
+                initial_directory = self._resolve_initial_directory(
+                    client, initial_directory
+                )
             if initial_directory or track_directory:
                 if transport is None:
                     raise paramiko.SSHException("SSH 传输通道不可用")
@@ -276,12 +290,14 @@ class InteractiveSSHSession:
                     # interactive input/history or changing startup files.
                     startup_command = (
                         "printf '\\033]777;DeployFlowShell;"
-                        f"{directory_token};%s\\007' \"$$\"; "
+                        f"{directory_token};%s;%s\\007' \"$$\" \"$PWD\"; "
                         + startup_command
                     )
                 if initial_directory:
                     startup_command = (
-                        f"cd -- {shlex.quote(initial_directory)} || exit; "
+                        f"cd -- {shlex.quote(initial_directory)} || {{ "
+                        "printf '[DeployFlow] 无法进入指定目录，已停留在登录目录。\\n' >&2; "
+                        "cd -- \"$HOME\" 2>/dev/null || :; }; "
                         + startup_command
                     )
                 if track_directory:
@@ -305,8 +321,10 @@ class InteractiveSSHSession:
                 if self._client is client:
                     self._client = None
                     self._channel = None
-            if cancelled or isinstance(exc, SSHSessionError):
+            if cancelled:
                 raise SSHSessionError("SSH 连接已取消") from exc
+            if isinstance(exc, SSHSessionError):
+                raise
             if isinstance(exc, paramiko.BadHostKeyException):
                 raise SSHSessionError(
                     "服务器主机密钥与 known_hosts 中保存的记录不一致，"
@@ -341,6 +359,36 @@ class InteractiveSSHSession:
             daemon=True,
         )
         self._reader.start()
+
+    @staticmethod
+    def _resolve_initial_directory(client: Any, value: str) -> str:
+        """Resolve paths from the server-path field and validate before opening the PTY."""
+        requested = value.strip().replace("\\", "/")
+        if not requested or any(ord(char) < 32 or ord(char) == 127 for char in requested):
+            raise SSHSessionError("服务器目录无效")
+        sftp = client.open_sftp()
+        try:
+            home = sftp.normalize(".")
+            if requested == "~":
+                resolved = home
+            elif requested.startswith("~/"):
+                resolved = posixpath.join(home, requested[2:])
+            elif requested.startswith("/"):
+                resolved = posixpath.normpath(requested)
+            else:
+                resolved = posixpath.normpath("/" + requested)
+            attributes = sftp.stat(resolved)
+            if not stat.S_ISDIR(attributes.st_mode):
+                raise SSHSessionError(f"服务器路径不是目录：{resolved}")
+            return resolved
+        except SSHSessionError:
+            raise
+        except OSError as exc:
+            raise SSHSessionError(
+                f"服务器目录不存在或无权访问：{requested}"
+            ) from exc
+        finally:
+            sftp.close()
 
     def register_shell(self, token: str, pid: int) -> bool:
         """Accept only the shell identity emitted by this connection attempt."""
@@ -540,7 +588,6 @@ class InteractiveSSHSession:
             raise SSHSessionError("SSH 尚未连接")
         client = paramiko.SSHClient()
         try:
-            client.load_system_host_keys()
             if self._known_hosts_path.is_file():
                 client.load_host_keys(str(self._known_hosts_path))
             client.set_missing_host_key_policy(paramiko.RejectPolicy())
@@ -614,12 +661,15 @@ class InteractiveSSHSession:
         if status != 0:
             raise SSHSessionError(error or output or "停止远程进程失败")
 
-    def copy_remote_path(self, source: str, target: str) -> None:
+    def copy_remote_path(
+        self, source: str, target: str, cancel_event: threading.Event | None = None,
+    ) -> None:
         """Copy on the server, without transferring file contents through the UI."""
         if not source.startswith("/") or not target.startswith("/") or not source.strip("/") or not target.strip("/"):
             raise SSHSessionError("复制需要明确的服务器文件路径，不能操作根目录")
         output, error, status = self._execute_mutating_command(
-            f"cp -a -- {shlex.quote(source)} {shlex.quote(target)}", 300
+            f"exec cp -a -- {shlex.quote(source)} {shlex.quote(target)}", 300,
+            cancel_event=cancel_event,
         )
         if status != 0:
             raise SSHSessionError(error.strip() or output.strip() or "服务器端复制失败")
@@ -761,7 +811,7 @@ if ! kill -0 "$new_pid" 2>/dev/null; then
     [ "$code" = 0 ] || fail "原进程已停止，新命令执行失败（$code）；请检查原日志或 $logfile"
     printf '%s\\n' "原命令已执行并返回 0；若程序转入后台，请刷新服务列表确认。日志：$logfile"
 else
-    printf '%s\\n' "已按记录的命令和工作目录启动，PID：$new_pid；原输出文件继续使用，其他输出见：$logfile"
+    printf '%s\\n' "已按记录的命令和工作目录启动，PID：$new_pid；若原输出指向普通文件，会尝试继续写入；补充日志：$logfile"
 fi
 """
         output, error, status = self._execute_mutating_command(
@@ -773,8 +823,11 @@ fi
 
     def _execute_mutating_command(
         self, command: str, timeout: int, stdin_data: bytes | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> tuple[str, str, int]:
         """Execute exactly once; drain both streams and always close the channel."""
+        if cancel_event is not None and cancel_event.is_set():
+            raise SSHSessionError("操作已取消")
         client = self._create_auxiliary_client()
         channel = None
         try:
@@ -788,6 +841,14 @@ fi
                 raise SSHSessionError("SSH 连接已断开")
             channel = transport.open_session(timeout=10)
             channel.settimeout(timeout)
+            if cancel_event is not None:
+                try:
+                    # Closing the PTY channel sends SIGHUP to the foreground copy.
+                    channel.get_pty()
+                except Exception:
+                    pass
+            if cancel_event is not None and cancel_event.is_set():
+                raise SSHSessionError("操作已取消")
             channel.exec_command(command)
             if stdin_data is not None:
                 channel.sendall(stdin_data)
@@ -795,6 +856,8 @@ fi
             output, error = bytearray(), bytearray()
             deadline = time.monotonic() + timeout
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise SSHSessionError("操作已取消")
                 if channel.recv_ready():
                     chunk = channel.recv(65536)
                     output.extend(chunk[:max(0, 1048576 - len(output))])

@@ -167,12 +167,12 @@ class WorkflowExecutor:
 
     def _new_connection(self, parameters: ServerParameters) -> Any:
         try:
-            from fabric import Connection
-            from paramiko import RejectPolicy
+            from fabric import Config, Connection
+            from paramiko import RejectPolicy, SSHConfig
         except ImportError as exc:
             raise WorkflowExecutionError("缺少 Fabric，请先安装 requirements.txt") from exc
 
-        connect_kwargs: dict[str, Any] = {}
+        connect_kwargs: dict[str, Any] = {"allow_agent": False, "look_for_keys": False}
         if parameters.auth_method == "PASSWORD":
             connect_kwargs.update(allow_agent=False, look_for_keys=False)
             if parameters.password:
@@ -195,6 +195,7 @@ class WorkflowExecutor:
             user=parameters.username,
             connect_kwargs=connect_kwargs,
             connect_timeout=self.connect_timeout,
+            config=Config(ssh_config=SSHConfig(), lazy=True),
         )
         known_hosts_path = self.parameter_dir.parent / "known_hosts"
         try:

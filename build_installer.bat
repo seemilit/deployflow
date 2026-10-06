@@ -14,37 +14,22 @@ if errorlevel 1 (
 set "PYTHON_EXE=python.exe"
 
 :find_inno
-set "ISCC_EXE="
+if not "%~1"=="" set "ISCC_EXE=%~f1"
+if defined ISCC_EXE (
+    if exist "%ISCC_EXE%" goto :check_files
+    echo [ERROR] The specified ISCC_EXE does not exist.
+    goto :failed
+)
+if exist "%~dp0tools\Inno Setup 6\ISCC.exe" (
+    set "ISCC_EXE=%~dp0tools\Inno Setup 6\ISCC.exe"
+    goto :check_files
+)
 where ISCC.exe >nul 2>nul
 if not errorlevel 1 set "ISCC_EXE=ISCC.exe"
 if defined ISCC_EXE goto :check_files
-if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-if defined ISCC_EXE goto :check_files
-if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles%\Inno Setup 6\ISCC.exe"
-if defined ISCC_EXE goto :check_files
-if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
-if defined ISCC_EXE goto :check_files
-
-echo Inno Setup 6 was not found. Installing it with WinGet...
-where winget.exe >nul 2>nul
-if errorlevel 1 (
-    echo [ERROR] WinGet was not found. Inno Setup cannot be installed automatically.
-    goto :failed
-)
-winget.exe install --id JRSoftware.InnoSetup -e --accept-package-agreements --accept-source-agreements
-if errorlevel 1 (
-    echo [ERROR] Inno Setup installation failed.
-    goto :failed
-)
-
-if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"
-if defined ISCC_EXE goto :check_files
-if exist "%ProgramFiles%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles%\Inno Setup 6\ISCC.exe"
-if defined ISCC_EXE goto :check_files
-if exist "%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
-if defined ISCC_EXE goto :check_files
-
-echo [ERROR] Inno Setup was installed, but ISCC.exe could not be located.
+echo [ERROR] Inno Setup 6 was not found. It will not be installed automatically.
+echo Pass the full path: build_installer.bat "path\to\ISCC.exe"
+echo Or set ISCC_EXE, use tools\Inno Setup 6, or add ISCC.exe to PATH.
 goto :failed
 
 :check_files

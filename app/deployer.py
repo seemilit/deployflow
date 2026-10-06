@@ -118,12 +118,12 @@ class FabricDeployer:
     ) -> bool:
         self._check_cancelled()
         try:
-            from fabric import Connection
-            from paramiko import RejectPolicy
+            from fabric import Config, Connection
+            from paramiko import RejectPolicy, SSHConfig
         except ImportError as exc:
             raise DeploymentError("缺少 Fabric，请先执行：pip install fabric") from exc
 
-        connect_kwargs: dict[str, Any] = {}
+        connect_kwargs: dict[str, Any] = {"allow_agent": False, "look_for_keys": False}
         if config.auth_method == "PASSWORD":
             connect_kwargs["allow_agent"] = False
             connect_kwargs["look_for_keys"] = False
@@ -146,6 +146,7 @@ class FabricDeployer:
             user=config.username,
             connect_kwargs=connect_kwargs,
             connect_timeout=self.connect_timeout,
+            config=Config(ssh_config=SSHConfig(), lazy=True),
         )
         known_hosts_path = (
             config.file_path.parent.parent / "known_hosts"

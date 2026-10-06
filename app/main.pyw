@@ -7,7 +7,7 @@ application_directory = str(Path(__file__).resolve().parent)
 if application_directory not in sys.path:
     sys.path.insert(0, application_directory)
 
-from application import main
+from application_qt import main
 
 
 if __name__ == "__main__":

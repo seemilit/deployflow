@@ -15,7 +15,7 @@ if errorlevel 1 (
 set "PYTHONW=pythonw.exe"
 
 :launch
-"%PYTHONW%" "%~dp0app\qt_main.pyw" "%~dp0conf\tasks" "%~dp0conf\parameters" "%~dp0conf\scripts" "%~dp0templates\server_parameters.template.txt" "%~dp0templates\remote_script.template.sh"
+"%PYTHONW%" "%~dp0app\qt_main.pyw" "%~dp0conf\tasks" "%~dp0conf\host" "%~dp0conf\scripts" "%~dp0templates\server_parameters.template.txt" "%~dp0templates\remote_script.template.sh"
 
 :finish
 popd

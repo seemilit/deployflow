@@ -14,6 +14,10 @@
     }
     .xterm { padding: 6px 8px; box-sizing: border-box; }
     .xterm-viewport { scrollbar-color: #64748b #111827; }
+    #terminal { position: relative; }
+    .path-links { position: absolute; inset: 0; pointer-events: none; overflow: hidden; z-index: 5; }
+    .path-links span { position: absolute; border-bottom: 2px solid currentColor; box-sizing: border-box; }
+    #terminal.path-hover .xterm-screen { cursor: pointer; }
   </style>
 </head>
 <body>
@@ -72,16 +76,269 @@
       }
 
       term.onData(function (data) { bridge.sendInput(data); });
+      const directoryValues = new Map();
+      const directoryBoundaries = [];
+      let firstDirectoryContext = 0;
+      term.parser.registerOscHandler(778, function (data) {
+        const match = /^DeployFlowDirectory;([0-9]+)$/.exec(data);
+        if (!match) return false;
+        if (term.buffer.active.type !== 'normal') return true;
+        const buffer = term.buffer.active;
+        const row = buffer.baseY + buffer.cursorY;
+        let firstRow = row;
+        while (firstRow > 0 && buffer.getLine(firstRow)?.isWrapped) firstRow--;
+        const marker = term.registerMarker(firstRow - row);
+        if (!marker) return true;
+        const boundary = {marker, id: Number(match[1])};
+        directoryBoundaries.push(boundary);
+        marker.onDispose(function () {
+          const index = directoryBoundaries.indexOf(boundary);
+          // A trimmed boundary still applies to its remaining scrollback lines.
+          if (index === 0) firstDirectoryContext = boundary.id;
+          if (index >= 0) directoryBoundaries.splice(index, 1);
+        });
+        return true;
+      });
       term.parser.registerOscHandler(777, function (data) {
-        const match = /^DeployFlowShell;([0-9a-f]{32});([0-9]{1,10})$/.exec(data);
+        const match = /^DeployFlowShell;([0-9a-f]{32});([0-9]{1,10})(?:;([^\x00-\x1f\x7f]*))?$/.exec(data);
         if (!match) return false;
         const pid = Number(match[2]);
-        if (pid > 1 && pid <= 2147483647) bridge.identifyShell(match[1], pid);
+        if (pid > 1 && pid <= 2147483647) {
+          const boundary = directoryBoundaries[directoryBoundaries.length - 1];
+          bridge.identifyShell(match[1], pid, match[3] || '', boundary ? boundary.id : firstDirectoryContext);
+        }
         return true;
       });
       term.onBinary(function (data) { bridge.sendBinary(btoa(data)); });
       term.onResize(function (size) { bridge.resizeTerminal(size.cols, size.rows); });
       term.onSelectionChange(function () { bridge.updateSelection(term.getSelection()); });
+      function cellAtPointer(event) {
+        const screen = term.element.querySelector('.xterm-screen');
+        if (!screen) return '';
+        const rect = screen.getBoundingClientRect();
+        if (!rect.width || !rect.height || event.clientX < rect.left ||
+            event.clientX >= rect.right || event.clientY < rect.top ||
+            event.clientY >= rect.bottom) return '';
+        const column = Math.floor((event.clientX - rect.left) * term.cols / rect.width);
+        const buffer = term.buffer.active;
+        const row = buffer.viewportY + Math.floor(
+          (event.clientY - rect.top) * term.rows / rect.height);
+        return {row, column};
+      }
+
+      function cellTextColor(cell) {
+        const theme = term.options.theme || {};
+        const inverse = cell.isInverse();
+        const fallback = inverse ? (theme.background || '#111827') : (theme.foreground || '#e5e7eb');
+        if (inverse ? cell.isBgDefault() : cell.isFgDefault()) return fallback;
+        let value = inverse ? cell.getBgColor() : cell.getFgColor();
+        if (inverse ? cell.isBgRGB() : cell.isFgRGB()) {
+          return '#' + value.toString(16).padStart(6, '0');
+        }
+        if (!(inverse ? cell.isBgPalette() : cell.isFgPalette())) return fallback;
+        if (!inverse && value < 8 && cell.isBold() && term.options.drawBoldTextInBrightColors) value += 8;
+        if (value < 16) {
+          const names = ['black', 'red', 'green', 'yellow', 'blue', 'magenta', 'cyan', 'white',
+            'brightBlack', 'brightRed', 'brightGreen', 'brightYellow', 'brightBlue', 'brightMagenta',
+            'brightCyan', 'brightWhite'];
+          return theme[names[value]] || fallback;
+        }
+        if (value < 232) {
+          const levels = [0, 95, 135, 175, 215, 255];
+          const index = value - 16;
+          return `rgb(${levels[Math.floor(index / 36)]},${levels[Math.floor(index / 6) % 6]},${levels[index % 6]})`;
+        }
+        const gray = 8 + (value - 232) * 10;
+        return `rgb(${gray},${gray},${gray})`;
+      }
+
+      function readLogicalLine(row) {
+        const buffer = term.buffer.active;
+        let first = row;
+        let last = row;
+        // Join soft-wrapped rows, but bound the work for very long output lines.
+        while (first > 0 && buffer.getLine(first)?.isWrapped && row - first < 32) first--;
+        if (buffer.getLine(first)?.isWrapped) return '';
+        while (buffer.getLine(last + 1)?.isWrapped && last - first < 32) last++;
+        if (buffer.getLine(last + 1)?.isWrapped) return '';
+        let text = '';
+        const cells = [];
+        for (let y = first; y <= last; y++) {
+          const line = buffer.getLine(y);
+          if (!line) return '';
+          for (let x = 0; x < term.cols; x++) {
+            const cell = line.getCell(x);
+            if (!cell) continue;
+            if (cell.getWidth() === 0) continue;
+            const start = text.length;
+            text += cell.getChars() || ' ';
+            cells.push({row: y, column: x, width: cell.getWidth(), start, end: text.length,
+              color: cellTextColor(cell)});
+          }
+          if (text.length > 8192) return '';
+        }
+        const tokens = /"[^"\r\n]+"|'[^'\r\n]+'|[^\s"'`|;&<>]+/g;
+        return {last, cells, tokens: Array.from(text.matchAll(tokens), match => ({
+          text: match[0], start: match.index, end: match.index + match[0].length
+        }))};
+      }
+
+      function textAtPointer(event) {
+        const position = cellAtPointer(event);
+        if (!position) return '';
+        const line = readLogicalLine(position.row);
+        if (!line) return '';
+        const cell = line.cells.find(value => value.row === position.row &&
+          position.column >= value.column && position.column < value.column + value.width);
+        const token = cell && line.tokens.find(value => cell.start >= value.start && cell.start < value.end);
+        return token ? token.text : '';
+      }
+
+      function directoryAtPointer(event) {
+        const position = cellAtPointer(event);
+        if (!position || term.buffer.active.type !== 'normal') return '';
+        let contextId = firstDirectoryContext;
+        for (const boundary of directoryBoundaries) {
+          if (!boundary.marker.isDisposed && boundary.marker.line <= position.row) contextId = boundary.id;
+        }
+        return directoryValues.get(contextId) || '';
+      }
+
+      let knownPathNames = new Set();
+      function isPathToken(text) {
+        const quoted = /^(["']).*\1$/.test(text);
+        const value = quoted ? text.slice(1, -1) : text.replace(/[,;:]+$/, '');
+        if (!value || value.includes('://') || (!quoted && /\s/.test(value))) return false;
+        if (knownPathNames.has(value) || quoted) return true;
+        if (['$', '#', '%', '->'].includes(value) || /^\[?[^\s]*@[^\s]*[#$]$/.test(value)) return false;
+        // Any filename can be extensionless or numeric; verify it only on click.
+        return true;
+      }
+
+      const terminalElement = document.getElementById('terminal');
+      const pathLinks = document.createElement('div');
+      pathLinks.className = 'path-links';
+      terminalElement.appendChild(pathLinks);
+      let controlPressed = false;
+      let pathFrame = 0;
+      let pressedPath = '';
+      let pressedDirectory = '';
+      let pointer = null;
+
+      function refreshPathLinks() {
+        pathFrame = 0;
+        pathLinks.replaceChildren();
+        terminalElement.classList.remove('path-hover');
+        if (!controlPressed || !pointer) return;
+        const position = cellAtPointer(pointer);
+        if (!position) return;
+        const line = readLogicalLine(position.row);
+        if (!line) return;
+        const hoveredCell = line.cells.find(value => value.row === position.row &&
+          position.column >= value.column && position.column < value.column + value.width);
+        const token = hoveredCell && line.tokens.find(value =>
+          hoveredCell.start >= value.start && hoveredCell.start < value.end);
+        if (!token || !isPathToken(token.text)) return;
+        const screen = term.element.querySelector('.xterm-screen');
+        if (!screen) return;
+        const rect = screen.getBoundingClientRect();
+        const container = terminalElement.getBoundingClientRect();
+        const top = term.buffer.active.viewportY;
+        const fragment = document.createDocumentFragment();
+        const segments = [];
+        for (const cell of line.cells) {
+          if (cell.row < top || cell.row >= top + term.rows ||
+              cell.start < token.start || cell.start >= token.end) continue;
+          const segment = segments[segments.length - 1];
+          if (segment && segment.row === cell.row && segment.color === cell.color && segment.end === cell.column) {
+            segment.end = cell.column + cell.width;
+          } else {
+            segments.push({row: cell.row, start: cell.column, end: cell.column + cell.width, color: cell.color});
+          }
+        }
+        for (const segment of segments) {
+          const underline = document.createElement('span');
+          underline.style.color = segment.color;
+          underline.style.left = `${rect.left - container.left + segment.start * rect.width / term.cols}px`;
+          underline.style.top = `${rect.top - container.top + (segment.row - top) * rect.height / term.rows}px`;
+          underline.style.width = `${(segment.end - segment.start) * rect.width / term.cols}px`;
+          underline.style.height = `${rect.height / term.rows}px`;
+          fragment.appendChild(underline);
+        }
+        pathLinks.appendChild(fragment);
+        terminalElement.classList.add('path-hover');
+      }
+
+      function schedulePathLinks() {
+        if (controlPressed && !pathFrame) pathFrame = requestAnimationFrame(refreshPathLinks);
+      }
+
+      function setControlPressed(value) {
+        if (controlPressed === value) return;
+        controlPressed = value;
+        if (value) schedulePathLinks();
+        else {
+          cancelAnimationFrame(pathFrame);
+          pathFrame = 0;
+          pressedPath = '';
+          pressedDirectory = '';
+          pathLinks.replaceChildren();
+          terminalElement.classList.remove('path-hover');
+        }
+      }
+
+      document.addEventListener('keydown', event => setControlPressed(event.ctrlKey), true);
+      document.addEventListener('keyup', event => setControlPressed(event.ctrlKey), true);
+      window.addEventListener('blur', () => { pointer = null; setControlPressed(false); });
+      terminalElement.addEventListener('mousemove', function (event) {
+        pointer = {clientX: event.clientX, clientY: event.clientY};
+        setControlPressed(event.ctrlKey);
+        schedulePathLinks();
+      });
+      terminalElement.addEventListener('mouseleave', function () {
+        pointer = null;
+        pathLinks.replaceChildren();
+        terminalElement.classList.remove('path-hover');
+      });
+      terminalElement.addEventListener('mousedown', function (event) {
+        pressedPath = '';
+        pressedDirectory = '';
+        if (event.button !== 0 || !event.ctrlKey) return;
+        const text = textAtPointer(event);
+        if (!isPathToken(text)) return;
+        pressedPath = text;
+        pressedDirectory = directoryAtPointer(event);
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }, true);
+      terminalElement.addEventListener('mouseup', function (event) {
+        if (event.button === 0 && pressedPath) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
+      }, true);
+      terminalElement.addEventListener('click', function (event) {
+        const text = pressedPath;
+        const directory = pressedDirectory;
+        pressedPath = '';
+        pressedDirectory = '';
+        if (event.button !== 0 || !event.ctrlKey || !text || text !== textAtPointer(event)) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        bridge.activateDirectory(text, directory);
+      }, true);
+      term.onRender(schedulePathLinks);
+      term.onScroll(schedulePathLinks);
+      term.onResize(schedulePathLinks);
+
+      terminalElement.addEventListener('contextmenu', function (event) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const selection = term.getSelection();
+        bridge.requestContextMenu(
+          Math.round(event.clientX), Math.round(event.clientY),
+          selection, selection || textAtPointer(event));
+      }, true);
       term.attachCustomKeyEventHandler(function (event) {
         if (event.type !== 'keydown' || !event.ctrlKey) return true;
         const key = event.key.toLowerCase();
@@ -90,15 +347,37 @@
           return false;
         }
         if (key === 'v') {
+          event.preventDefault();
+          event.stopPropagation();
           bridge.requestPaste();
           return false;
         }
         return true;
       });
 
+      document.addEventListener('paste', function (event) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        bridge.requestPaste();
+      }, true);
+
       bridge.writeRequested.connect(function (data) { term.write(data); });
-      bridge.clearRequested.connect(function () { term.clear(); });
+      bridge.clearRequested.connect(function () {
+        term.clear();
+        for (const boundary of [...directoryBoundaries]) boundary.marker.dispose();
+        directoryValues.clear();
+        firstDirectoryContext = 0;
+      });
       bridge.focusRequested.connect(function () { term.focus(); });
+      bridge.scrollToBottomRequested.connect(function () { term.scrollToBottom(); });
+      bridge.pathHintsChanged.connect(function (data) {
+        knownPathNames = new Set(JSON.parse(data));
+        schedulePathLinks();
+      });
+      bridge.directoryContextChanged.connect(function (contextId, directory) {
+        directoryValues.set(contextId, directory);
+        while (directoryValues.size > 10000) directoryValues.delete(directoryValues.keys().next().value);
+      });
       bridge.fitRequested.connect(fitTerminal);
       bridge.pasteTextRequested.connect(function (data) { term.paste(data); });
       new ResizeObserver(fitTerminal).observe(document.getElementById('terminal'));

@@ -1,20 +1,17 @@
 """Ordered task-workflow configuration.
 
-New task files use STEP_<number>_<FIELD> keys.  Each step owns only the
-parameters it needs, so server A and server B can be used in one task.
+Task files use version 2 JSON documents with an ordered list of step objects.
+Each step owns only the parameters it needs.
 """
 
 from __future__ import annotations
 
 import json
-import re
 from dataclasses import dataclass
 from pathlib import Path
 
 from config import ConfigurationError
 
-
-_STEP_KEY = re.compile(r"STEP_(\d+)_([A-Z][A-Z0-9_]*)")
 
 
 @dataclass(frozen=True)
@@ -143,64 +140,41 @@ class WorkflowTask:
     steps: tuple[WorkflowStep, ...]
 
 
-def is_workflow_task(path: str | Path) -> bool:
-    content = Path(path).read_text(encoding="utf-8-sig")
-    if bool(re.search(r"(?m)^\s*STEP_\d+_TYPE\s*=", content)):
-        return True
+def parse_workflow_document(content: str) -> dict[str, object]:
+    """Read the current storage format without requiring executable steps."""
     try:
         document = json.loads(content)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        raise ConfigurationError(
+            "任务仅支持新版 JSON 工作流；旧格式不再支持，请重新创建任务。"
+        ) from exc
+    if not isinstance(document, dict) or document.get("version") != 2:
+        raise ConfigurationError("任务必须是 version 为 2 的 JSON 工作流")
+    steps = document.get("steps")
+    if not isinstance(steps, list):
+        raise ConfigurationError("任务的 steps 必须是步骤列表")
+    for index, step in enumerate(steps, start=1):
+        if not isinstance(step, dict):
+            raise ConfigurationError(f"第 {index} 步必须是步骤对象")
+        if not isinstance(step.get("type"), str) or not step["type"].strip():
+            raise ConfigurationError(f"第 {index} 步缺少步骤类型")
+        if not isinstance(step.get("properties", {}), dict):
+            raise ConfigurationError(f"第 {index} 步的 properties 必须是对象")
+    return document
+
+
+def is_workflow_task(path: str | Path) -> bool:
+    try:
+        parse_workflow_document(Path(path).read_text(encoding="utf-8-sig"))
+    except ConfigurationError:
         return False
-    return isinstance(document, dict) and isinstance(document.get("steps"), list)
+    return True
 
 
 def load_workflow_task(path: str | Path) -> WorkflowTask:
     file_path = Path(path).resolve()
-    content = file_path.read_text(encoding="utf-8-sig")
-    try:
-        document = json.loads(content)
-    except json.JSONDecodeError:
-        document = None
-    if isinstance(document, dict) and isinstance(document.get("steps"), list):
-        return _load_object_workflow(file_path, document["steps"])
-    values: dict[int, dict[str, str]] = {}
-    for line_number, raw_line in enumerate(
-        content.splitlines(), start=1
-    ):
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
-            raise ConfigurationError(f"第 {line_number} 行必须使用 KEY=VALUE 格式")
-        key, value = (part.strip() for part in line.split("=", 1))
-        match = _STEP_KEY.fullmatch(key.upper())
-        if match is None:
-            raise ConfigurationError(
-                f"第 {line_number} 行存在不支持的配置项：{key}"
-            )
-        index = int(match.group(1))
-        if index <= 0:
-            raise ConfigurationError("步骤编号必须从 1 开始")
-        step_values = values.setdefault(index, {})
-        field = match.group(2)
-        if field in step_values:
-            raise ConfigurationError(f"第 {line_number} 行重复配置 STEP_{index}_{field}")
-        step_values[field] = value
-
-    if not values:
-        raise ConfigurationError("任务中没有流程步骤，请点击“增加步骤”创建")
-    indexes = sorted(values)
-
-    steps: list[WorkflowStep] = []
-    for index in indexes:
-        step_values = values[index]
-        step_type = step_values.get("TYPE", "").upper()
-        if step_type not in WORKFLOW_TYPE_BY_KEY:
-            raise ConfigurationError(f"第 {index} 步的 TYPE 不支持：{step_type or '未填写'}")
-        _validate_step(index, step_type, step_values)
-        steps.append(WorkflowStep(index, step_type, step_values))
-    _validate_unique_names(steps)
-    return WorkflowTask(file_path.stem, file_path, tuple(steps))
+    document = parse_workflow_document(file_path.read_text(encoding="utf-8-sig"))
+    return _load_object_workflow(file_path, document["steps"])
 
 
 def _load_object_workflow(file_path: Path, raw_steps: list[object]) -> WorkflowTask:

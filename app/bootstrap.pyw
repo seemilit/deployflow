@@ -6,6 +6,7 @@ import ctypes
 import sys
 import traceback
 from pathlib import Path
+from datetime import datetime
 
 
 def _report_startup_failure(error: BaseException) -> None:
@@ -16,7 +17,12 @@ def _report_startup_failure(error: BaseException) -> None:
     )
     log_path: Path | None = application_root / "startup-error.log"
     try:
-        log_path.write_text(traceback.format_exc(), encoding="utf-8")
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        content = "".join(
+            f"[{timestamp}] {line}" if line != "\n" else line
+            for line in traceback.format_exc().splitlines(keepends=True)
+        )
+        log_path.write_text(content, encoding="utf-8")
     except OSError:
         log_path = None
 
@@ -38,7 +44,7 @@ def main() -> None:
         if application_directory not in sys.path:
             sys.path.insert(0, application_directory)
         # A regular import lets cx_Freeze discover the application and its imports.
-        from application import main as run_application
+        from application_qt import main as run_application
 
         run_application()
     except SystemExit:

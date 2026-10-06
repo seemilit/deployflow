@@ -54,7 +54,7 @@ if errorlevel 8 (
     goto :failed
 )
 if not exist "%PACKAGE_DIR%\conf\tasks" mkdir "%PACKAGE_DIR%\conf\tasks"
-if not exist "%PACKAGE_DIR%\conf\parameters" mkdir "%PACKAGE_DIR%\conf\parameters"
+if not exist "%PACKAGE_DIR%\conf\host" mkdir "%PACKAGE_DIR%\conf\host"
 if not exist "%PACKAGE_DIR%\conf\scripts" mkdir "%PACKAGE_DIR%\conf\scripts"
 rmdir /S /Q "%STAGING_DIR%" 2>nul
 
