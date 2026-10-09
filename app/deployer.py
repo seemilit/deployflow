@@ -121,7 +121,9 @@ class FabricDeployer:
             from fabric import Config, Connection
             from paramiko import RejectPolicy, SSHConfig
         except ImportError as exc:
-            raise DeploymentError("缺少 Fabric，请先执行：pip install fabric") from exc
+            raise DeploymentError(
+                f"SSH 依赖加载失败（{type(exc).__name__}）：{exc}"
+            ) from exc
 
         connect_kwargs: dict[str, Any] = {"allow_agent": False, "look_for_keys": False}
         if config.auth_method == "PASSWORD":

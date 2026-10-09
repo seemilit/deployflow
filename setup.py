@@ -29,14 +29,18 @@ setup(
     options={
         "build_exe": {
             "include_msvcr": True,
+            "bin_excludes": [
+                "qtwebengine_devtools_resources.debug.pak",
+            ],
             "packages": [
                 "fabric",
+                "unittest",
                 "paramiko",
                 "pyte",
-                "PySide6",
                 "i18n",
             ],
             "includes": [
+                "unittest.mock",
                 "application_qt",
                 "builder",
                 "config",
@@ -49,6 +53,10 @@ setup(
                 "qt_xterm_terminal",
                 "terminal_directory_cache",
                 "windows_drag",
+                "PySide6.QtCore",
+                "PySide6.QtGui",
+                "PySide6.QtWidgets",
+                "PySide6.QtNetwork",
                 "PySide6.QtWebChannel",
                 "PySide6.QtWebEngineCore",
                 "PySide6.QtWebEngineWidgets",
