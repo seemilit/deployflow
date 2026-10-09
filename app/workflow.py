@@ -45,10 +45,6 @@ WORKFLOW_TYPES = (
         WorkflowFieldDefinition(
             "SOURCE_PROJECT_PATH", "源项目目录（自动读取该目录当前分支作为待合并分支）", True
         ),
-        WorkflowFieldDefinition(
-            "COMMIT_MESSAGE", "无代码差异时已暂存修改的提交说明", False,
-            default="自动提交暂存修改"
-        ),
     )),
     WorkflowTypeDefinition("PUSH_BRANCH", "推送分支（pull → commit → push）", (
         WorkflowFieldDefinition("PROJECT_PATH", "执行推送的本地项目目录", True),
@@ -201,6 +197,8 @@ def _load_object_workflow(file_path: Path, raw_steps: list[object]) -> WorkflowT
 def _validate_step(index: int, step_type: str, values: dict[str, str]) -> None:
     definition = WORKFLOW_TYPE_BY_KEY[step_type]
     allowed = {"TYPE", *(field.key for field in definition.fields)}
+    if step_type == "MERGE_BRANCH":
+        allowed.add("COMMIT_MESSAGE")
     unsupported = sorted(set(values) - allowed)
     if unsupported:
         raise ConfigurationError(
