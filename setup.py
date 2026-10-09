@@ -28,6 +28,7 @@ setup(
     ],
     options={
         "build_exe": {
+            "include_msvcr": True,
             "packages": [
                 "fabric",
                 "paramiko",
