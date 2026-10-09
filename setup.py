@@ -40,6 +40,7 @@ setup(
                 "i18n",
             ],
             "includes": [
+                "unittest",
                 "unittest.mock",
                 "application_qt",
                 "builder",
