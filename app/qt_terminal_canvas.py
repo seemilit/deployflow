@@ -69,6 +69,7 @@ class TerminalCanvas(QAbstractScrollArea):
         self._refresh_metrics()
 
     def set_screen_lock(self, lock) -> None:
+        print("Hello World from set_screen_lock")
         self._screen_lock = lock
 
     def _screen_guard(self):
