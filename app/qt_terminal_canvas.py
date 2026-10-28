@@ -20,7 +20,7 @@ _ANSI_COLORS = {
     "cyan": "#11a8cd", "white": "#e5e5e5",
     "brightblack": "#666666", "brightred": "#f14c4c", "brightgreen": "#23d18b",
     "brightbrown": "#f5f543", "brightblue": "#3b8eea", "brightmagenta": "#d670d6",
-    "brightcyan": "#29b8db", "brightwhite": "#ffffff",
+    "brightcyan": "#29b8db",  "brightwhite": "#ffffff",
 }
 
 
@@ -69,6 +69,7 @@ class TerminalCanvas(QAbstractScrollArea):
         self._refresh_metrics()
 
     def set_screen_lock(self, lock) -> None:
+        print("Hello World")
         self._screen_lock = lock
 
     def _screen_guard(self):
